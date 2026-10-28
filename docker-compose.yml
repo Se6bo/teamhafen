@@ -1,0 +1,86 @@
+# Teamhafen: welche Teile laufen, steht in .env
+#   MODULES           Module des Portals, z. B. "vault" oder "vault,docs,office,sprints,ai"
+#   COMPOSE_PROFILES  Zusatzdienste: vault (Vaultwarden), office (Collabora), https (Caddy mit Zertifikat)
+# Das Skript install.sh legt .env passend an.
+services:
+  app:
+    build: .
+    image: teamhafen:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: "80"
+      DB_PATH: /data/portal.db
+      UPLOAD_DIR: /data/uploads
+      VW_URL: http://vaultwarden:80
+      COLLABORA_INTERNAL_URL: http://collabora:9980
+      WOPI_BASE_URL: http://app:80
+      # Nur beim allerersten Start von install.sh gesetzt
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    volumes:
+      - ./data/app:/data
+    ports:
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8080}:80"
+    depends_on:
+      vaultwarden:
+        condition: service_started
+        required: false
+    networks: [portal, intern]
+
+  # Speicher des Tresors. Nur intern erreichbar, Konten legt ausschließlich das Portal an.
+  vaultwarden:
+    image: vaultwarden/server:1.37.3
+    profiles: [vault]
+    restart: unless-stopped
+    environment:
+      DOMAIN: http://vaultwarden
+      SIGNUPS_ALLOWED: "false"
+      SIGNUPS_VERIFY: "false"
+      SIGNUPS_DOMAINS_WHITELIST: ${VW_ACCOUNT_DOMAIN:-teamhafen.local}
+      INVITATIONS_ALLOWED: "false"
+      WEB_VAULT_ENABLED: "false"
+      LOG_LEVEL: warn
+    volumes:
+      - ./data/vaultwarden:/data
+    networks: [intern]
+
+  # Office im Browser (Word, Excel, PowerPoint). Braucht etwa 1 bis 2 GB RAM.
+  collabora:
+    image: collabora/code:25.04.5.1.1
+    profiles: [office]
+    restart: unless-stopped
+    environment:
+      aliasgroup1: http://app:80
+      server_name: ${PUBLIC_HOST:-localhost}
+      dictionaries: de_DE en_US
+      extra_params: >-
+        --o:ssl.enable=false --o:ssl.termination=true
+        --o:net.frame_ancestors=${PUBLIC_HOST:-localhost}
+        --o:home_mode.enable=true --o:mount_jail_tree=false
+        --o:admin_console.enable=false
+    ports:
+      - "127.0.0.1:${COLLABORA_PORT:-9980}:9980"
+    cap_add: [MKNOD]
+    networks: [portal]
+
+  # Optional: Caddy holt das HTTPS Zertifikat und leitet Office Pfade an Collabora weiter.
+  # Nur nutzen, wenn auf dem Server noch kein anderer Reverse Proxy auf Port 80 und 443 läuft.
+  caddy:
+    image: caddy:2.10
+    profiles: [https]
+    restart: unless-stopped
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy:/data
+    networks: [portal]
+
+networks:
+  portal:
+  # Ohne Internet: hier spricht nur das Portal mit Vaultwarden
+  intern:
+    internal: true

@@ -1,0 +1,27 @@
+{
+  "name": "teamhafen-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch server/index.mjs",
+    "start": "node server/index.mjs"
+  },
+  "dependencies": {
+    "@mixmark-io/domino": "^2.2.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@simplewebauthn/server": "^13.0.0",
+    "bcryptjs": "^3.0.2",
+    "better-sqlite3": "^13.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "marked": "^18.1.2",
+    "multer": "^2.5.0",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2",
+    "zod": "^4.6.7"
+  }
+}

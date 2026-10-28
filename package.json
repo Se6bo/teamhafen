@@ -1,0 +1,14 @@
+{
+  "name": "teamhafen",
+  "version": "1.0.0",
+  "description": "Selbst gehostetes Teamportal: Passwort Tresor mit Vaultwarden, Dokumentation, Office, Jira Sprints und MCP für die eigene KI. Modular.",
+  "private": true,
+  "license": "MIT",
+  "workspaces": [
+    "server"
+  ],
+  "scripts": {
+    "start": "npm run start --workspace=server",
+    "dev": "npm run dev --workspace=server"
+  }
+}

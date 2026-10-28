@@ -1,0 +1,1545 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dokumentation</title>
+<script src="/config.js"></script>
+<link rel="stylesheet" href="/assets/common.css">
+<link rel="stylesheet" href="/assets/docs.css">
+<script>try { if (localStorage.getItem('darkMode') === 'true') document.documentElement.setAttribute('data-theme', 'dark'); } catch {}</script>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="toastRegion" class="toast-region" aria-live="polite"></div>
+<script type="module">
+  import {
+    APP,
+    appTitle,
+    hasModule,
+    bindHeader,
+    closeDialog,
+    loadJiraMirror,
+    onSearchNavigate,
+    openDialog,
+    escapeHtml,
+    fetchJson,
+    headerHTML,
+    requireSession,
+    showToast,
+    state,
+  } from '/assets/common.js';
+  import { createMarkdown, hasHtmlTags, looksLikeMarkdown, normalizeDocContent, sanitizeDocHtml } from '/assets/doc-content.mjs';
+  import { Marked } from '/assets/vendor/marked.esm.js';
+
+  /* ---------- Zustand ---------- */
+  // selectedFolder: 'all' (alle Dokumente), null (oberste Ebene) oder eine Ordner-ID
+  const docsState = {
+    docs: [],
+    folders: [],
+    files: [],
+    officeExtensions: [],
+    selectedFolder: null,
+    selectedDocId: null,
+    selectedFileId: null,
+    expanded: new Set(readStored('docsExpanded', [])),
+    search: '',
+    renamingFolderId: null,
+  };
+
+  function readStored(key, fallback) {
+    try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
+  }
+
+  function persistView() {
+    try {
+      localStorage.setItem('docsExpanded', JSON.stringify([...docsState.expanded]));
+      localStorage.setItem('docsLast', JSON.stringify({ folder: docsState.selectedFolder, doc: docsState.selectedDocId, file: docsState.selectedFileId }));
+    } catch {}
+  }
+
+  function attr(value) {
+    return escapeHtml(value).replace(/"/g, '&quot;');
+  }
+
+  const ICON = {
+    folder: '<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M2 5.2C2 4.5 2.6 4 3.3 4h4.1l1.7 1.8h7.6c.7 0 1.3.5 1.3 1.2v7.8c0 .7-.6 1.2-1.3 1.2H3.3C2.6 16 2 15.5 2 14.8V5.2Z" fill="#F2B84B"/><path d="M2 7.4h16v7.4c0 .7-.6 1.2-1.3 1.2H3.3C2.6 16 2 15.5 2 14.8V7.4Z" fill="#F7CC63"/></svg>',
+    folderOpen: '<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M2 5.2C2 4.5 2.6 4 3.3 4h4.1l1.7 1.8h7.6c.7 0 1.3.5 1.3 1.2v1.2H5.1L2 14.6V5.2Z" fill="#F2B84B"/><path d="M4.6 8.6h14.1l-2.6 6.7c-.2.4-.6.7-1.1.7H2.3l2.3-7.4Z" fill="#F7CC63"/></svg>',
+    root: '<svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 4.5A1.5 1.5 0 0 1 4.5 3H9v14H4.5A1.5 1.5 0 0 1 3 15.5v-11ZM11 3h4.5A1.5 1.5 0 0 1 17 4.5v11a1.5 1.5 0 0 1-1.5 1.5H11V3Z"/></svg>',
+    all: '<svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="14" height="14" rx="2.5"/><path d="M6.5 7h7M6.5 10h7M6.5 13h4"/></svg>',
+    doc: '<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M5 2.5h6.5L15.5 6.5v10a1 1 0 0 1-1 1h-9.5a1 1 0 0 1-1-1v-13a1 1 0 0 1 1-1Z" fill="var(--panel)" stroke="var(--accent)" stroke-width="1.4"/><path d="M11.5 2.5v4h4" fill="none" stroke="var(--accent)" stroke-width="1.4"/><path d="M6.8 10h6.4M6.8 12.6h6.4M6.8 15.1h4" stroke="var(--text-soft)" stroke-width="1.2" stroke-linecap="round"/></svg>',
+    chevron: '<svg viewBox="0 0 20 20" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7.5 4.5 13 10l-5.5 5.5"/></svg>',
+    clip: '<svg viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15.5 9.5-5.8 5.8a3.6 3.6 0 0 1-5.1-5.1l6.2-6.2a2.4 2.4 0 0 1 3.4 3.4l-6.1 6.1a1.2 1.2 0 0 1-1.7-1.7l5.5-5.5"/></svg>',
+  };
+
+  /* ---------- Baum-Hilfen ---------- */
+  const collator = new Intl.Collator('de', { numeric: true, sensitivity: 'base' });
+
+  function folderById(id) {
+    return docsState.folders.find(f => f.id === Number(id)) || null;
+  }
+
+  function childFolders(parentId) {
+    return docsState.folders
+      .filter(f => (f.parent_id ?? null) === parentId)
+      .sort((a, b) => collator.compare(a.name, b.name));
+  }
+
+  function docsIn(folderId) {
+    return docsState.docs
+      .filter(d => (d.folder_id ?? null) === folderId)
+      .sort((a, b) => collator.compare(a.title, b.title));
+  }
+
+  function filesIn(folderId) {
+    return docsState.files
+      .filter(f => (f.folder_id ?? null) === folderId)
+      .sort((a, b) => collator.compare(a.original_name, b.original_name));
+  }
+
+  function countRecursive(folderId) {
+    return docsIn(folderId).length + filesIn(folderId).length + childFolders(folderId).reduce((sum, f) => sum + countRecursive(f.id), 0);
+  }
+
+  /* ---------- Dateitypen ---------- */
+  const MAX_UPLOAD = 50 * 1024 * 1024;
+  const FILE_KINDS = {
+    pdf: { label: 'PDF', color: '#E5484D', exts: ['pdf'] },
+    word: { label: 'W', color: '#2F6BFF', exts: ['doc', 'docx', 'odt', 'rtf'] },
+    excel: { label: 'X', color: '#1F9D55', exts: ['xls', 'xlsx', 'ods', 'csv'] },
+    powerpoint: { label: 'P', color: '#E8772E', exts: ['ppt', 'pptx', 'odp'] },
+    image: { label: 'IMG', color: '#8B5CF6', exts: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'] },
+    text: { label: 'TXT', color: '#64748B', exts: ['txt', 'md', 'log', 'json', 'xml', 'yml', 'yaml', 'conf', 'cfg', 'ini', 'sh'] },
+  };
+
+  function fileExt(name) {
+    const m = /\.([a-z0-9]+)$/i.exec(String(name || ''));
+    return m ? m[1].toLowerCase() : '';
+  }
+
+  function fileKind(name) {
+    const ext = fileExt(name);
+    return Object.keys(FILE_KINDS).find(k => FILE_KINDS[k].exts.includes(ext)) || 'other';
+  }
+
+  function fileIcon(name, size = 18) {
+    const kind = FILE_KINDS[fileKind(name)] || { label: fileExt(name).slice(0, 3).toUpperCase() || '?', color: '#64748B' };
+    return `<span class="dx-kind" style="--kind:${kind.color};width:${size}px;height:${size}px" aria-hidden="true">${escapeHtml(kind.label.length > 1 && size < 22 ? kind.label[0] : kind.label)}</span>`;
+  }
+
+  function formatSize(bytes) {
+    const n = Number(bytes) || 0;
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+    return `${(n / 1024 / 1024).toFixed(n < 10 * 1024 * 1024 ? 1 : 0).replace('.', ',')} MB`;
+  }
+
+  function personName(first, last, username) {
+    return [first, last].filter(Boolean).join(' ') || username || 'Unbekannt';
+  }
+
+  function canEditInOffice(file) {
+    return docsState.officeExtensions.includes(fileExt(file.original_name));
+  }
+
+  function isAdminUser() {
+    return state.currentUser?.role === 'admin' || state.currentUser?.role === 'owner';
+  }
+
+  function folderPath(folderId) {
+    const path = [];
+    const seen = new Set();
+    let current = folderById(folderId);
+    while (current && !seen.has(current.id)) {
+      path.unshift(current);
+      seen.add(current.id);
+      current = folderById(current.parent_id);
+    }
+    return path;
+  }
+
+  function isSameOrDescendant(candidateId, folderId) {
+    return folderPath(candidateId).some(f => f.id === Number(folderId));
+  }
+
+  function folderLabel(folderId) {
+    if (folderId === 'all') return 'Alle Dokumente';
+    if (folderId === null) return 'Dokumentation';
+    return folderById(folderId)?.name || 'Ordner';
+  }
+
+  function formatDocDate(value) {
+    if (!value) return '';
+    const d = new Date(String(value).replace(' ', 'T') + (String(value).includes('Z') ? '' : 'Z'));
+    if (Number.isNaN(d.getTime())) return '';
+    return new Intl.DateTimeFormat('de-DE', { dateStyle: 'short', timeStyle: 'short' }).format(d);
+  }
+
+  function expandPathTo(folderId) {
+    for (const f of folderPath(folderId)) {
+      if (f.id !== Number(folderId)) docsState.expanded.add(f.id);
+    }
+  }
+
+  /* ---------- Laden ---------- */
+  async function loadDocs() {
+    const [docsResult, foldersResult, filesResult] = await Promise.all([fetchJson('/api/docs'), fetchJson('/api/docs/folders'), fetchJson('/api/docs/files')]);
+    if (!docsResult.res.ok || !Array.isArray(docsResult.data)) {
+      showToast(docsResult.data?.error || 'Dokumentation konnte nicht geladen werden.', true);
+      return;
+    }
+    docsState.docs = docsResult.data.map(d => ({ ...d, id: Number(d.id), folder_id: d.folder_id == null ? null : Number(d.folder_id) }));
+    docsState.folders = (foldersResult.res.ok && Array.isArray(foldersResult.data) ? foldersResult.data : [])
+      .map(f => ({ ...f, id: Number(f.id), parent_id: f.parent_id == null ? null : Number(f.parent_id) }));
+    const filesData = filesResult.res.ok ? filesResult.data : null;
+    docsState.files = (filesData?.files || []).map(f => ({ ...f, id: Number(f.id), folder_id: f.folder_id == null ? null : Number(f.folder_id) }));
+    docsState.officeExtensions = filesData?.officeExtensions || [];
+    if (docsState.selectedFolder !== 'all' && docsState.selectedFolder !== null && !folderById(docsState.selectedFolder)) {
+      docsState.selectedFolder = null;
+    }
+    renderTree();
+    renderFiles();
+  }
+
+  /* ---------- Linke Spalte: Ordnerbaum ---------- */
+  function treeRow({ key, depth, icon, label, count, expandable = false, expanded = false, draggable = false }) {
+    const selected = String(docsState.selectedFolder) === String(key);
+    const isRenaming = docsState.renamingFolderId !== null && String(docsState.renamingFolderId) === String(key);
+    const name = isRenaming
+      ? `<input class="dx-rename" type="text" value="${attr(label)}" aria-label="Ordnername" maxlength="120">`
+      : `<span class="dx-name">${escapeHtml(label)}</span>`;
+    return `
+      <div class="dx-row${selected ? ' is-selected' : ''}" role="treeitem" tabindex="${selected ? 0 : -1}"
+           data-node="${key}" ${expandable ? `aria-expanded="${expanded}"` : ''} aria-selected="${selected}"
+           ${draggable ? 'draggable="true"' : ''} style="--depth:${depth}">
+        <span class="dx-twisty${expandable ? '' : ' is-empty'}${expanded ? ' is-open' : ''}" data-toggle="${key}" aria-hidden="true">${expandable ? ICON.chevron : ''}</span>
+        <span class="dx-icon">${icon}</span>
+        ${name}
+        <span class="dx-count">${count}</span>
+      </div>`;
+  }
+
+  function treeBranch(parentId, depth) {
+    return childFolders(parentId).map(folder => {
+      const hasChildren = childFolders(folder.id).length > 0;
+      const expanded = hasChildren && docsState.expanded.has(folder.id);
+      return treeRow({
+        key: folder.id, depth, icon: expanded ? ICON.folderOpen : ICON.folder, label: folder.name,
+        count: countRecursive(folder.id), expandable: hasChildren, expanded, draggable: true,
+      }) + (expanded ? `<div role="group">${treeBranch(folder.id, depth + 1)}</div>` : '');
+    }).join('');
+  }
+
+  function renderTree() {
+    const tree = document.getElementById('dxTree');
+    if (!tree) return;
+    tree.innerHTML =
+      treeRow({ key: 'all', depth: 0, icon: ICON.all, label: 'Alle Dokumente', count: docsState.docs.length + docsState.files.length }) +
+      '<div class="dx-tree-sep" role="separator"></div>' +
+      treeRow({ key: 'null', depth: 0, icon: ICON.root, label: 'Dokumentation', count: docsState.docs.length + docsState.files.length, expandable: true, expanded: true }) +
+      `<div role="group">${treeBranch(null, 1)}</div>`;
+
+    const input = tree.querySelector('.dx-rename');
+    if (input) {
+      input.focus();
+      input.select();
+      let done = false;
+      const finish = async (save) => {
+        if (done) return;
+        done = true;
+        const id = docsState.renamingFolderId;
+        docsState.renamingFolderId = null;
+        const name = input.value.trim();
+        if (save && name && name !== folderById(id)?.name) await renameFolder(id, name);
+        else renderTree();
+      };
+      input.addEventListener('keydown', (e) => {
+        e.stopPropagation();
+        if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+        if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+      });
+      input.addEventListener('blur', () => finish(true));
+      input.addEventListener('click', e => e.stopPropagation());
+    }
+  }
+
+  function nodeValue(key) {
+    if (key === 'all') return 'all';
+    if (key === 'null' || key === '' || key === undefined) return null;
+    return Number(key);
+  }
+
+  async function selectFolder(value, { focus = false } = {}) {
+    docsState.selectedFolder = value;
+    docsState.search = '';
+    const searchEl = document.getElementById('dxSearch');
+    if (searchEl) searchEl.value = '';
+    if (typeof value === 'number') expandPathTo(value);
+    persistView();
+    renderTree();
+    renderFiles();
+    if (focus) document.querySelector(`.dx-row[data-node="${value}"]`)?.focus();
+  }
+
+  function toggleFolder(id) {
+    if (docsState.expanded.has(id)) docsState.expanded.delete(id);
+    else docsState.expanded.add(id);
+    persistView();
+    renderTree();
+    document.querySelector(`.dx-row[data-node="${id}"]`)?.focus();
+  }
+
+  function onTreeKeydown(e) {
+    const row = e.target.closest('.dx-row');
+    if (!row || e.target.classList.contains('dx-rename')) return;
+    const rows = [...document.querySelectorAll('#dxTree .dx-row')];
+    const idx = rows.indexOf(row);
+    const value = nodeValue(row.dataset.node);
+    const isFolder = typeof value === 'number';
+    if (e.key === 'ArrowDown') { e.preventDefault(); rows[Math.min(idx + 1, rows.length - 1)]?.focus(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); rows[Math.max(idx - 1, 0)]?.focus(); }
+    else if (e.key === 'ArrowRight' && isFolder) {
+      e.preventDefault();
+      if (childFolders(value).length && !docsState.expanded.has(value)) toggleFolder(value);
+      else rows[idx + 1]?.focus();
+    } else if (e.key === 'ArrowLeft' && isFolder) {
+      e.preventDefault();
+      if (docsState.expanded.has(value)) toggleFolder(value);
+      else document.querySelector(`.dx-row[data-node="${folderById(value)?.parent_id ?? 'null'}"]`)?.focus();
+    } else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectFolder(value, { focus: true }); }
+    else if (e.key === 'F2' && isFolder) { e.preventDefault(); startRenameFolder(value); }
+    else if (e.key === 'Delete' && isFolder) { e.preventDefault(); deleteFolder(value); }
+  }
+
+  /* ---------- Rechte Spalte: Dateien im Ordner ---------- */
+  function fileRowFolder(folder) {
+    return `
+      <div class="dx-file" role="listitem" tabindex="0" draggable="true" data-open-folder="${folder.id}" data-node="${folder.id}">
+        <span class="dx-icon">${ICON.folder}</span>
+        <span class="dx-file-main"><strong>${escapeHtml(folder.name)}</strong><small>Ordner · ${countRecursive(folder.id)} Eintr${countRecursive(folder.id) === 1 ? 'ag' : 'äge'}</small></span>
+      </div>`;
+  }
+
+  function fileRowUpload(file, { showPath = false } = {}) {
+    const selected = file.id === docsState.selectedFileId;
+    const path = showPath ? (folderPath(file.folder_id).map(f => f.name).join(' › ') || 'Dokumentation') : '';
+    const meta = [path, formatSize(file.size), formatDocDate(file.updated_at || file.uploaded_at)].filter(Boolean).join(' · ');
+    return `
+      <div class="dx-file${selected ? ' is-selected' : ''}" role="listitem" tabindex="0" draggable="true" data-ffile="${file.id}">
+        <span class="dx-icon">${fileIcon(file.original_name)}</span>
+        <span class="dx-file-main"><strong>${escapeHtml(file.original_name)}</strong><small>${escapeHtml(meta)}</small></span>
+      </div>`;
+  }
+
+  function fileRowDoc(doc, { showPath = false } = {}) {
+    const selected = doc.id === docsState.selectedDocId;
+    const path = showPath ? (folderPath(doc.folder_id).map(f => f.name).join(' › ') || 'Dokumentation') : '';
+    const meta = [path, formatDocDate(doc.updated_at || doc.created_at), doc.author_username].filter(Boolean).join(' · ');
+    return `
+      <div class="dx-file${selected ? ' is-selected' : ''}" role="listitem" tabindex="0" draggable="true" data-doc="${doc.id}">
+        <span class="dx-icon">${ICON.doc}</span>
+        <span class="dx-file-main"><strong>${escapeHtml(doc.title)}</strong><small>${escapeHtml(meta)}</small></span>
+      </div>`;
+  }
+
+  function breadcrumbHTML(folderId, { links = true } = {}) {
+    if (folderId === 'all') return '<span class="dx-crumb is-current">Alle Dokumente</span>';
+    const parts = [{ key: 'null', label: 'Dokumentation' }, ...folderPath(folderId).map(f => ({ key: f.id, label: f.name }))];
+    return parts.map((p, i) => {
+      const last = i === parts.length - 1;
+      return (i ? '<span class="dx-crumb-sep" aria-hidden="true">›</span>' : '') + (links && !last
+        ? `<button type="button" class="dx-crumb" data-crumb="${p.key}">${escapeHtml(p.label)}</button>`
+        : `<span class="dx-crumb${last ? ' is-current' : ''}">${escapeHtml(p.label)}</span>`);
+    }).join('');
+  }
+
+  function renderFiles() {
+    const list = document.getElementById('dxFiles');
+    const crumbs = document.getElementById('dxFilesCrumbs');
+    if (!list) return;
+    const q = docsState.search.trim().toLowerCase();
+    const current = docsState.selectedFolder;
+    crumbs.innerHTML = q ? `<span class="dx-crumb is-current">Suche: „${escapeHtml(docsState.search.trim())}“</span>` : breadcrumbHTML(current);
+
+    let html = '';
+    if (q) {
+      const folders = docsState.folders.filter(f => f.name.toLowerCase().includes(q)).sort((a, b) => collator.compare(a.name, b.name));
+      const docs = docsState.docs.filter(d => d.title.toLowerCase().includes(q) || String(d.content || '').replace(/<[^>]+>/g, ' ').toLowerCase().includes(q))
+        .sort((a, b) => collator.compare(a.title, b.title));
+      const files = docsState.files.filter(f => f.original_name.toLowerCase().includes(q)).sort((a, b) => collator.compare(a.original_name, b.original_name));
+      html = folders.map(fileRowFolder).join('') + docs.map(d => fileRowDoc(d, { showPath: true })).join('') + files.map(f => fileRowUpload(f, { showPath: true })).join('');
+      if (!html) html = '<div class="dx-empty">Nichts gefunden.</div>';
+    } else if (current === 'all') {
+      const items = [
+        ...docsState.docs.map(d => ({ at: String(d.updated_at || d.created_at || ''), html: () => fileRowDoc(d, { showPath: true }) })),
+        ...docsState.files.map(f => ({ at: String(f.updated_at || f.uploaded_at || ''), html: () => fileRowUpload(f, { showPath: true }) })),
+      ].sort((a, b) => b.at.localeCompare(a.at));
+      html = items.map(i => i.html()).join('') || '<div class="dx-empty">Noch keine Dokumente.</div>';
+    } else {
+      html = childFolders(current).map(fileRowFolder).join('') + docsIn(current).map(d => fileRowDoc(d)).join('') + filesIn(current).map(f => fileRowUpload(f)).join('');
+      if (!html) html = '<div class="dx-empty">Dieser Ordner ist leer.<br>Lege oben ein Dokument an oder ziehe Dateien (PDF, Word, Excel …) hierher.</div>';
+    }
+    list.innerHTML = html;
+    document.getElementById('btnDxNewFolderHere').disabled = current === 'all' && !q;
+  }
+
+  /* ---------- Jira-Verweise im Text (z. B. PROJ-45) ---------- */
+  const jira = { mirror: null, loading: null };
+
+  function jiraKeyPattern() {
+    const key = (jira.mirror?.meta?.projectKey || '').replace(/[^A-Z0-9]/gi, '');
+    if (!key) return null; // ohne Jira gibt es nichts zu verlinken
+    return new RegExp(`\\b${key}-\\d+\\b`, 'g');
+  }
+
+  function ensureJiraMirror() {
+    if (!jira.loading) jira.loading = loadJiraMirror().then(m => { jira.mirror = m; return m; });
+    return jira.loading;
+  }
+
+  // Wandelt Aufgabenschlüssel im Text in Links um (nicht innerhalb bestehender Links oder Code)
+  function linkifyJiraRefs(root) {
+    const pattern = jiraKeyPattern();
+    if (!root || !pattern) return;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: (node) => node.parentElement?.closest('a, code, pre') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+    });
+    const nodes = [];
+    while (walker.nextNode()) {
+      pattern.lastIndex = 0;
+      if (pattern.test(walker.currentNode.nodeValue)) nodes.push(walker.currentNode);
+    }
+    for (const node of nodes) {
+      pattern.lastIndex = 0;
+      const text = node.nodeValue;
+      const frag = document.createDocumentFragment();
+      let last = 0, m;
+      while ((m = pattern.exec(text))) {
+        frag.append(text.slice(last, m.index));
+        const a = document.createElement('a');
+        a.className = 'jira-ref';
+        a.href = `/sprints?issue=${m[0]}`;
+        a.dataset.jiraKey = m[0];
+        a.textContent = m[0];
+        frag.append(a);
+        last = m.index + m[0].length;
+      }
+      frag.append(text.slice(last));
+      node.replaceWith(frag);
+    }
+  }
+
+  // Status und Titel live aus dem Jira-Spiegel anzeigen (wird vor dem Speichern wieder entfernt)
+  function decorateJiraRefs(root) {
+    if (!root) return;
+    root.querySelectorAll('a.jira-ref').forEach(a => {
+      const issue = jira.mirror?.issues.get(a.dataset.jiraKey);
+      if (issue) {
+        a.dataset.status = issue.status?.category || 'new';
+        a.title = `${issue.summary} · ${issue.status?.name || ''}${issue.assignee ? ' · ' + issue.assignee.displayName : ''}`;
+      } else {
+        a.dataset.status = jira.mirror ? 'missing' : '';
+        a.title = jira.mirror ? 'Aufgabe nicht gefunden' : '';
+      }
+    });
+  }
+
+  function cleanJiraRefs(html) {
+    const tpl = document.createElement('template');
+    tpl.innerHTML = html;
+    tpl.content.querySelectorAll('a.jira-ref').forEach(a => { a.removeAttribute('data-status'); a.removeAttribute('title'); });
+    return tpl.innerHTML;
+  }
+
+  function closeJiraPopover() {
+    document.getElementById('dxJiraPop')?.remove();
+  }
+
+  function showJiraPopover(a) {
+    closeJiraPopover();
+    const key = a.dataset.jiraKey;
+    const issue = jira.mirror?.issues.get(key);
+    const base = jira.mirror?.meta?.baseUrl;
+    const pop = document.createElement('div');
+    pop.id = 'dxJiraPop';
+    pop.className = 'dx-jira-pop';
+    pop.innerHTML = issue ? `
+      <div class="dx-jira-pop-key">${escapeHtml(key)} · ${escapeHtml(issue.type?.name || '')}</div>
+      <strong>${escapeHtml(issue.summary)}</strong>
+      <div class="dx-jira-pop-meta"><span class="jira-ref-status" data-status="${attr(issue.status?.category || 'new')}">${escapeHtml(issue.status?.name || '')}</span>
+        ${issue.assignee ? escapeHtml(issue.assignee.displayName) : 'Nicht zugewiesen'}${issue.sprint ? ' · ' + escapeHtml(issue.sprint.name) : ''}</div>
+      <div class="dx-jira-pop-actions">
+        <a class="btn btn-primary" href="/sprints?issue=${encodeURIComponent(key)}">Im Portal öffnen</a>
+        ${base ? `<a class="btn" href="${attr(base)}/browse/${encodeURIComponent(key)}" target="_blank" rel="noopener">In Jira ↗</a>` : ''}
+      </div>` : `<div class="dx-jira-pop-key">${escapeHtml(key)}</div><span class="dx-muted">${jira.mirror ? 'Diese Aufgabe gibt es (nicht mehr) im Jira-Projekt.' : 'Jira ist gerade nicht erreichbar.'}</span>`;
+    document.body.append(pop);
+    const r = a.getBoundingClientRect();
+    pop.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8))}px`;
+    pop.style.top = `${r.bottom + 6 + pop.offsetHeight > window.innerHeight ? r.top - pop.offsetHeight - 6 : r.bottom + 6}px`;
+  }
+
+  // Auswahlfenster: Jira-Aufgabe an der Cursorposition einfügen
+  function openJiraPicker(savedRange) {
+    const issues = [...(jira.mirror?.issues.values() || [])]
+      .sort((a, b) => b.key.localeCompare(a.key, 'de', { numeric: true }));
+    const body = showModal(`
+      <h2>Jira-Aufgabe einfügen</h2>
+      <div class="field"><input type="search" id="dxPickerSearch" placeholder="Schlüssel oder Titel suchen …" aria-label="Aufgabe suchen"></div>
+      <div class="dx-picker-list" id="dxPickerList"></div>
+      <div class="modal-actions"><button type="button" class="btn" data-close>Abbrechen</button></div>
+    `);
+    const list = body.querySelector('#dxPickerList');
+    const render = (q = '') => {
+      const needle = q.trim().toLowerCase();
+      const hits = issues.filter(i => !needle || i.key.toLowerCase().includes(needle) || i.summary.toLowerCase().includes(needle)).slice(0, 60);
+      list.innerHTML = hits.length ? hits.map(i => `
+        <button type="button" class="dx-picker-item" data-key="${attr(i.key)}">
+          <span class="jira-ref" data-status="${attr(i.status?.category || 'new')}">${escapeHtml(i.key)}</span>
+          <span class="dx-picker-title">${escapeHtml(i.summary)}</span>
+        </button>`).join('') : `<div class="dx-empty">${jira.mirror ? 'Keine passende Aufgabe.' : 'Jira ist gerade nicht erreichbar.'}</div>`;
+    };
+    render();
+    const input = body.querySelector('#dxPickerSearch');
+    input.focus();
+    input.addEventListener('input', () => render(input.value));
+    list.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-key]');
+      if (!btn) return;
+      closeModal();
+      const editor = document.getElementById('documentationContentInput');
+      if (!editor) return;
+      editor.focus();
+      const sel = window.getSelection();
+      if (savedRange && editor.contains(savedRange.startContainer)) { sel.removeAllRanges(); sel.addRange(savedRange); }
+      const key = btn.dataset.key;
+      document.execCommand('insertHTML', false, `<a class="jira-ref" href="/sprints?issue=${key}" data-jira-key="${key}">${key}</a>&nbsp;`);
+      decorateJiraRefs(editor);
+    });
+  }
+
+  /* ---------- Modal-Helfer ---------- */
+  function showModal(html, { wide = false } = {}) {
+    const overlay = document.getElementById('dxModal');
+    const body = document.getElementById('dxModalBody');
+    body.className = 'modal dx-modal' + (wide ? ' is-wide' : '');
+    body.innerHTML = html;
+    if (overlay.hidden) openDialog(overlay);
+    else { overlay.removeEventListener('keydown', overlay._onKey); openDialog(overlay, { keepFocus: true }); }
+    body.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', closeModal));
+    return body;
+  }
+
+  function closeModal() {
+    const overlay = document.getElementById('dxModal');
+    if (overlay && !overlay.hidden) closeDialog(overlay);
+  }
+
+  /* ---------- Versionsverlauf ---------- */
+  async function openVersionHistory(docId) {
+    await flushDocSave();
+    const [{ res, data }, current] = await Promise.all([
+      fetchJson(`/api/docs/${docId}/versions`),
+      fetchJson(`/api/docs/${docId}`),
+    ]);
+    if (!res.ok || !Array.isArray(data)) { showToast(data?.error || 'Verlauf konnte nicht geladen werden.', true); return; }
+    const author = v => [v.author_first_name, v.author_last_name].filter(Boolean).join(' ') || v.author_username || 'Unbekannt';
+    const when = v => formatDocDate(v.created_at);
+    const entries = [
+      { id: 'current', label: 'Aktueller Stand', meta: `zuletzt geändert ${formatDocDate(current.data?.updated_at)}`, content: current.data?.content || '' },
+      ...data.map(v => ({ id: v.version_number, label: `Version ${v.version_number}`, meta: `${when(v)} · gesichert vor Änderung von ${author(v)}`, content: v.content || '' })),
+    ];
+    const body = showModal(`
+      <div class="dx-history-head">
+        <h2>Versionsverlauf</h2>
+        <button type="button" class="btn btn-icon" data-close aria-label="Schließen">✕</button>
+      </div>
+      <p class="modal-note">Beim Bearbeiten wird der vorherige Stand automatisch gesichert: eine neue Version entsteht, wenn die letzte älter als 10 Minuten ist oder von jemand anderem stammt. Änderungen über die KI und das Wiederherstellen sichern immer vorher den aktuellen Stand.</p>
+      <div class="dx-history">
+        <div class="dx-history-list" role="listbox" aria-label="Versionen">
+          ${entries.map((e, i) => `
+            <button type="button" class="dx-history-item${i === 0 ? ' is-selected' : ''}" data-version="${e.id}" role="option">
+              <strong>${escapeHtml(e.label)}</strong><small>${escapeHtml(e.meta)}</small>
+            </button>`).join('')}
+          ${data.length ? '' : '<div class="dx-empty dx-empty-small">Noch keine älteren Versionen.</div>'}
+        </div>
+        <div class="dx-history-preview">
+          <div class="dx-history-preview-body docs-rich-editor" id="dxHistoryPreview"></div>
+          <div class="dx-history-actions">
+            <button type="button" class="btn btn-primary" id="dxRestoreVersion" hidden>Diese Version wiederherstellen</button>
+          </div>
+        </div>
+      </div>
+    `, { wide: true });
+
+    const preview = body.querySelector('#dxHistoryPreview');
+    const restoreBtn = body.querySelector('#dxRestoreVersion');
+    let selected = 'current';
+    const show = (id) => {
+      selected = id;
+      const entry = entries.find(e => String(e.id) === String(id));
+      preview.innerHTML = renderDocumentationContent(entry?.content || '') || '<p class="dx-muted"><em>(leer)</em></p>';
+      linkifyJiraRefs(preview);
+      decorateJiraRefs(preview);
+      restoreBtn.hidden = id === 'current';
+      body.querySelectorAll('.dx-history-item').forEach(b => b.classList.toggle('is-selected', b.dataset.version === String(id)));
+    };
+    show('current');
+    body.querySelector('.dx-history-list').addEventListener('click', (e) => {
+      const item = e.target.closest('[data-version]');
+      if (item) show(item.dataset.version);
+    });
+    restoreBtn.addEventListener('click', async () => {
+      if (!confirm(`Version ${selected} wiederherstellen? Der aktuelle Stand wird vorher als neue Version gesichert.`)) return;
+      const { res: r, data: d } = await fetchJson(`/api/docs/${docId}/restore/${selected}`, { method: 'POST' });
+      if (!r.ok || d?.error) { showToast(d?.error || 'Wiederherstellen fehlgeschlagen.', true); return; }
+      closeModal();
+      showToast(`Version ${selected} wiederhergestellt.`);
+      const item = docsState.docs.find(x => x.id === Number(docId));
+      if (item) item.updated_at = d.updated_at;
+      await openDoc(docId);
+    });
+  }
+
+  /* ---------- Mitte: Editor ---------- */
+  let flushDocSave = async () => {};
+
+  // Nach dem Verlassen einer im Office-Editor geöffneten Datei Größe/Datum neu laden
+  function refreshAfterOffice() {
+    if (docsState.selectedFileId) setTimeout(() => loadDocs(), 1500);
+  }
+
+  async function openDoc(id) {
+    await flushDocSave();
+    const { res, data } = await fetchJson(`/api/docs/${id}`);
+    if (!res.ok || !data) { showToast(data?.error || 'Dokument konnte nicht geladen werden.', true); return; }
+    refreshAfterOffice();
+    docsState.selectedFileId = null;
+    docsState.selectedDocId = Number(data.id);
+    persistView();
+    renderFiles();
+    renderEditor(data);
+    loadAttachments(data.id);
+  }
+
+  function showEmptyEditor() {
+    flushDocSave = async () => {};
+    const editor = document.getElementById('dxEditor');
+    if (editor) {
+      editor.dataset.docId = '';
+      editor.dataset.fileId = '';
+      editor.innerHTML = '<div class="docs-empty"><div><h3>Dokument auswählen</h3><p>Rechts ein Dokument öffnen oder ein neues anlegen.</p></div></div>';
+    }
+    const attachments = document.getElementById('dxAttachments');
+    if (attachments) attachments.innerHTML = '';
+  }
+
+  /* ---------- Mitte: Datei anzeigen / im Office-Editor bearbeiten ---------- */
+  async function openFile(id) {
+    await flushDocSave();
+    flushDocSave = async () => {};
+    const file = docsState.files.find(f => f.id === Number(id));
+    if (!file) { showToast('Datei nicht gefunden.', true); return; }
+    refreshAfterOffice();
+    docsState.selectedDocId = null;
+    docsState.selectedFileId = file.id;
+    persistView();
+    renderFiles();
+    renderFileViewer(file);
+    const attachments = document.getElementById('dxAttachments');
+    if (attachments) attachments.innerHTML = '';
+  }
+
+  function renderFileViewer(file) {
+    const editor = document.getElementById('dxEditor');
+    if (!editor) return;
+    editor.dataset.docId = '';
+    editor.dataset.fileId = String(file.id);
+    const ext = fileExt(file.original_name);
+    const base = ext ? file.original_name.slice(0, -(ext.length + 1)) : file.original_name;
+    const url = `/uploads/${encodeURIComponent(file.filename)}`;
+    const kind = fileKind(file.original_name);
+    const uploader = personName(file.uploader_first_name, file.uploader_last_name, file.uploader_username);
+    const editorName = personName(file.editor_first_name, file.editor_last_name, file.editor_username);
+    const edited = file.updated_at && file.updated_at !== file.uploaded_at;
+    editor.innerHTML = `
+      <div class="dx-editor-crumbs">${breadcrumbHTML(file.folder_id)}</div>
+      <div class="dx-file-head">
+        ${fileIcon(file.original_name, 30)}
+        <input id="dxFileName" class="dx-title-input dx-file-name" type="text" value="${attr(base)}" aria-label="Dateiname">
+        ${ext ? `<span class="dx-file-ext">.${escapeHtml(ext)}</span>` : ''}
+      </div>
+      <div class="dx-editor-meta">
+        <label for="dxFileFolder">Ordner</label>
+        <select id="dxFileFolder">${folderOptions(file.folder_id)}</select>
+        <span class="dx-file-info">${escapeHtml(formatSize(file.size))} · hochgeladen von ${escapeHtml(uploader)} am ${escapeHtml(formatDocDate(file.uploaded_at))}${edited ? ` · zuletzt bearbeitet von ${escapeHtml(editorName)} am ${escapeHtml(formatDocDate(file.updated_at))}` : ''}</span>
+        <span class="dx-file-actions">
+          <a class="btn" href="${url}" download="${attr(file.original_name)}">⬇ Herunterladen</a>
+          ${kind === 'pdf' || kind === 'image' ? `<a class="btn" href="${url}" target="_blank" rel="noopener">↗ Neuer Tab</a>` : ''}
+          ${file.can_delete ? '<button type="button" class="btn btn-danger" id="dxFileDelete">Löschen</button>' : ''}
+        </span>
+      </div>
+      <div class="dx-viewer" id="dxViewer"></div>
+    `;
+    editor.querySelectorAll('[data-crumb]').forEach(b => b.addEventListener('click', () => selectFolder(nodeValue(b.dataset.crumb))));
+
+    // Umbenennen (Endung bleibt) und Verschieben
+    const nameInput = editor.querySelector('#dxFileName');
+    const saveName = async () => {
+      const value = nameInput.value.trim();
+      if (!value || value === base) { nameInput.value = base; return; }
+      const { res, data } = await fetchJson(`/api/docs/files/${file.id}`, { method: 'PUT', body: JSON.stringify({ original_name: ext ? `${value}.${ext}` : value }) });
+      if (!res.ok) { showToast(data?.error || 'Umbenennen fehlgeschlagen.', true); nameInput.value = base; return; }
+      // Die Liste kann inzwischen neu geladen sein – den aktuellen Eintrag aktualisieren
+      const current = docsState.files.find(f => f.id === file.id);
+      if (current) Object.assign(current, data, { id: Number(data.id), folder_id: data.folder_id == null ? null : Number(data.folder_id) });
+      Object.assign(file, data);
+      showToast('Datei umbenannt.');
+      renderFiles();
+    };
+    nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); nameInput.blur(); } if (e.key === 'Escape') { nameInput.value = base; nameInput.blur(); } });
+    nameInput.addEventListener('blur', saveName);
+    editor.querySelector('#dxFileFolder').addEventListener('change', (e) => moveFile(file.id, e.target.value ? Number(e.target.value) : null));
+    editor.querySelector('#dxFileDelete')?.addEventListener('click', () => deleteFile(file.id));
+
+    const viewer = editor.querySelector('#dxViewer');
+    if (file.missing) {
+      viewer.innerHTML = `<div class="docs-empty"><div>${fileIcon(file.original_name, 46)}<h3>Datei fehlt auf dem Server</h3><p>„${escapeHtml(file.original_name)}“ ist nicht mehr vorhanden (vermutlich vor dem Umzug ins dauerhafte Speicher-Volume hochgeladen).<br>Bitte die Datei löschen und neu hochladen.</p></div></div>`;
+    } else if (kind === 'pdf') {
+      viewer.innerHTML = `<iframe class="dx-viewer-frame" src="${url}#view=FitH" title="${attr(file.original_name)}"></iframe>`;
+    } else if (kind === 'image') {
+      viewer.innerHTML = `<div class="dx-viewer-image"><img src="${url}" alt="${attr(file.original_name)}"></div>`;
+    } else if (canEditInOffice(file)) {
+      openInOffice(file, viewer);
+    } else {
+      viewer.innerHTML = `<div class="docs-empty"><div>${fileIcon(file.original_name, 46)}<h3>${escapeHtml(file.original_name)}</h3><p>Für diesen Dateityp gibt es keine Vorschau im Browser.</p><p><a class="btn btn-primary" href="${url}" download="${attr(file.original_name)}">⬇ Herunterladen</a></p></div></div>`;
+    }
+  }
+
+  async function openInOffice(file, viewer) {
+    viewer.innerHTML = '<div class="docs-empty"><div><p>Office-Editor wird geladen …</p></div></div>';
+    const { res, data } = await fetchJson(`/api/docs/files/${file.id}/office`);
+    if (document.getElementById('dxEditor')?.dataset.fileId !== String(file.id)) return;
+    const url = `/uploads/${encodeURIComponent(file.filename)}`;
+    if (!res.ok || !data?.enabled) {
+      viewer.innerHTML = `<div class="docs-empty"><div>${fileIcon(file.original_name, 46)}<h3>${escapeHtml(file.original_name)}</h3><p>${escapeHtml(data?.reason || 'Der Office-Editor ist gerade nicht erreichbar.')}</p><p><a class="btn btn-primary" href="${url}" download="${attr(file.original_name)}">⬇ Herunterladen</a></p></div></div>`;
+      return;
+    }
+    // Ist der Editor über die öffentliche Adresse erreichbar (Caddy-Weiterleitung eingerichtet)?
+    try {
+      const probe = await fetch(new URL('/hosting/capabilities', data.actionUrl), { credentials: 'omit' });
+      if (!(probe.headers.get('content-type') || '').includes('json')) throw new Error('kein Collabora');
+    } catch {
+      if (document.getElementById('dxEditor')?.dataset.fileId !== String(file.id)) return;
+      viewer.innerHTML = `<div class="docs-empty"><div>${fileIcon(file.original_name, 46)}<h3>Office-Editor noch nicht freigeschaltet</h3><p>Der Editor läuft, ist aber über ${escapeHtml(new URL(data.actionUrl).host)} noch nicht erreichbar.<br>Der Reverse Proxy muss <code>/browser</code>, <code>/hosting</code> und <code>/cool</code> an Collabora weiterleiten (siehe README, Abschnitt Office).</p><p><a class="btn btn-primary" href="${url}" download="${attr(file.original_name)}">⬇ Herunterladen</a></p></div></div>`;
+      return;
+    }
+    if (document.getElementById('dxEditor')?.dataset.fileId !== String(file.id)) return;
+    // Collabora erwartet das Zugriffstoken per POST-Formular in den iframe
+    const frameName = `dxOffice${file.id}_${Date.now()}`;
+    viewer.innerHTML = `
+      <form id="dxOfficeForm" action="${attr(data.actionUrl)}" method="post" target="${frameName}" hidden>
+        <input name="access_token" value="${attr(data.accessToken)}" type="hidden">
+        <input name="access_token_ttl" value="${attr(data.accessTokenTtl)}" type="hidden">
+      </form>
+      <iframe class="dx-viewer-frame dx-office-frame" name="${frameName}" title="Office-Editor: ${attr(file.original_name)}" allow="clipboard-read; clipboard-write; fullscreen" allowfullscreen></iframe>`;
+    viewer.querySelector('#dxOfficeForm').submit();
+  }
+
+  async function moveFile(fileId, folderId) {
+    const file = docsState.files.find(f => f.id === fileId);
+    if (!file || (file.folder_id ?? null) === folderId) return;
+    const { res, data } = await fetchJson(`/api/docs/files/${fileId}`, { method: 'PUT', body: JSON.stringify({ folder_id: folderId }) });
+    if (!res.ok) { showToast(data?.error || 'Verschieben fehlgeschlagen.', true); return; }
+    file.folder_id = folderId;
+    showToast(`„${file.original_name}“ verschoben nach „${folderLabel(folderId)}“`);
+    renderTree();
+    renderFiles();
+    if (docsState.selectedFileId === fileId) {
+      const editor = document.getElementById('dxEditor');
+      const crumbs = editor?.querySelector('.dx-editor-crumbs');
+      if (crumbs) {
+        crumbs.innerHTML = breadcrumbHTML(folderId);
+        crumbs.querySelectorAll('[data-crumb]').forEach(b => b.addEventListener('click', () => selectFolder(nodeValue(b.dataset.crumb))));
+      }
+      const select = document.getElementById('dxFileFolder');
+      if (select) select.innerHTML = folderOptions(folderId);
+    }
+  }
+
+  async function deleteFile(fileId) {
+    const file = docsState.files.find(f => f.id === fileId);
+    if (!file) return;
+    if (!confirm(`Datei „${file.original_name}“ endgültig löschen?`)) return;
+    const { res, data } = await fetchJson(`/api/docs/files/${fileId}`, { method: 'DELETE' });
+    if (!res.ok) { showToast(data?.error || 'Datei konnte nicht gelöscht werden.', true); return; }
+    if (docsState.selectedFileId === fileId) {
+      docsState.selectedFileId = null;
+      showEmptyEditor();
+    }
+    persistView();
+    showToast('Datei gelöscht.');
+    await loadDocs();
+  }
+
+  // Dateien hochladen (Button oder Drag & Drop vom Rechner)
+  async function uploadFolderFiles(fileList, folderId) {
+    const files = [...(fileList || [])];
+    if (!files.length) return;
+    const tooBig = files.filter(f => f.size > MAX_UPLOAD);
+    if (tooBig.length) showToast(`Zu groß (max. 50 MB): ${tooBig.map(f => f.name).join(', ')}`, true);
+    const ok = files.filter(f => f.size <= MAX_UPLOAD);
+    let last = null;
+    for (let i = 0; i < ok.length; i++) {
+      showToast(ok.length > 1 ? `Lade hoch (${i + 1}/${ok.length}): ${ok[i].name}` : `Lade hoch: ${ok[i].name}`);
+      const fd = new FormData();
+      fd.append('folder_id', folderId ?? '');
+      fd.append('file', ok[i]);
+      try {
+        const response = await fetch('/api/docs/files', { method: 'POST', body: fd, headers: { 'Authorization': `Bearer ${state.token}` } });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || 'Upload fehlgeschlagen');
+        last = data;
+      } catch (e) {
+        showToast(`${ok[i].name}: ${e.message}`, true);
+      }
+    }
+    if (!last) return;
+    if (docsState.selectedFolder !== 'all' && docsState.selectedFolder !== folderId) {
+      docsState.selectedFolder = folderId;
+      if (typeof folderId === 'number') expandPathTo(folderId);
+    }
+    await loadDocs();
+    showToast(ok.length > 1 ? `${ok.length} Dateien hochgeladen.` : 'Datei hochgeladen.');
+    if (ok.length === 1) openFile(Number(last.id));
+  }
+
+  function pickAndUpload(folderId) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.onchange = () => uploadFolderFiles(input.files, folderId);
+    input.click();
+  }
+
+  // Allowlist und Markdown-Umwandlung kommen aus /assets/doc-content.mjs – dieselben Regeln nutzt der Server.
+  // Ein eigenes, inertes Dokument: Beim Parsen werden keine Bilder geladen und keine Skripte ausgeführt.
+  const inertDoc = document.implementation.createHTMLDocument('');
+  const markdownToHtml = createMarkdown(Marked);
+
+  function sanitizeDocumentationHtml(html) {
+    return sanitizeDocHtml(html, inertDoc);
+  }
+
+  // Zum Anzeigen: alte Inhalte aus reinem Text (z. B. Importe) als Markdown darstellen
+  function renderDocumentationContent(content) {
+    return normalizeDocContent(content, { doc: inertDoc, markdown: markdownToHtml });
+  }
+
+  // Einfügen: HTML durch die Allowlist schicken; reinen Text, der nach Markdown aussieht, umwandeln.
+  // Liefert null, wenn der Browser normal einfügen soll (reiner Text ohne Markdown, Bilder).
+  const SEMANTIC_TAGS = /<(h[1-6]|ul|ol|li|table|pre|strong|b|em|i|a|code|blockquote)\b/i;
+  function pastedHtml(clipboard) {
+    const html = clipboard.getData('text/html');
+    const text = clipboard.getData('text/plain');
+    // Editoren wie VS Code liefern Markdown als eingefärbtes HTML ohne Struktur – dann zählt der Text
+    if (text && looksLikeMarkdown(text) && !hasHtmlTags(text) && (!html || !SEMANTIC_TAGS.test(html))) {
+      return sanitizeDocumentationHtml(markdownToHtml(text));
+    }
+    if (html) return sanitizeDocumentationHtml(html);
+    return null;
+  }
+
+  function folderOptions(selectedId) {
+    const opts = [`<option value="" ${selectedId == null ? 'selected' : ''}>Dokumentation (oberste Ebene)</option>`];
+    const walk = (parentId, depth) => {
+      for (const f of childFolders(parentId)) {
+        opts.push(`<option value="${f.id}" ${f.id === selectedId ? 'selected' : ''}>${'   '.repeat(depth)}${escapeHtml(f.name)}</option>`);
+        walk(f.id, depth + 1);
+      }
+    };
+    walk(null, 1);
+    return opts.join('');
+  }
+
+  function execDocumentationCommand(command, value = null) {
+    document.getElementById('documentationContentInput')?.focus();
+    document.execCommand(command, false, value);
+  }
+
+  function renderEditor(doc) {
+    const editor = document.getElementById('dxEditor');
+    if (!editor) return;
+    const docId = Number(doc.id);
+    const folderId = doc.folder_id == null ? null : Number(doc.folder_id);
+    editor.dataset.docId = String(docId);
+    editor.innerHTML = `
+      <div class="dx-editor-crumbs">${breadcrumbHTML(folderId)}</div>
+      <input id="documentationTitleInput" class="dx-title-input" type="text" value="${attr(doc.title || '')}" aria-label="Titel" placeholder="Titel">
+      <div class="dx-editor-meta">
+        <label for="documentationFolderInput">Ordner</label>
+        <select id="documentationFolderInput">${folderOptions(folderId)}</select>
+        <span id="documentationAutosaveStatus" class="dx-save-status">✓ Gespeichert</span>
+        <button type="button" class="btn dx-history-btn" id="btnDocHistory" title="Frühere Versionen ansehen und wiederherstellen">🕘 Verlauf</button>
+      </div>
+      <div class="docs-rich-toolbar">
+        <button type="button" data-doc-cmd="bold" title="Fett"><b>F</b></button>
+        <button type="button" data-doc-cmd="italic" title="Kursiv"><i>K</i></button>
+        <button type="button" data-doc-cmd="underline" title="Unterstrichen"><u>U</u></button>
+        <button type="button" data-doc-cmd="strikeThrough" title="Durchgestrichen"><s>S</s></button>
+        <select id="documentationHeadingSelect" aria-label="Absatzformat"><option value="p">Normal</option><option value="h1">Überschrift 1</option><option value="h2">Überschrift 2</option><option value="h3">Überschrift 3</option></select>
+        <button type="button" data-doc-cmd="insertUnorderedList">• Liste</button>
+        <button type="button" data-doc-cmd="insertOrderedList">1. Liste</button>
+        <button type="button" data-doc-cmd="justifyLeft" title="Linksbündig">←</button>
+        <button type="button" data-doc-cmd="justifyCenter" title="Zentriert">↔</button>
+        <button type="button" data-doc-cmd="justifyRight" title="Rechtsbündig">→</button>
+        <button type="button" id="btnInsertDocumentationImage">🖼 Bild</button>
+        <button type="button" id="btnInsertJiraRef" title="Verweis auf eine Jira-Aufgabe einfügen">🔗 Aufgabe</button>
+        <button type="button" data-doc-cmd="removeFormat">Format löschen</button>
+      </div>
+      <div id="documentationContentInput" class="docs-rich-editor" contenteditable="true" spellcheck="true">${renderDocumentationContent(doc.content || '')}</div>
+      <div class="docs-editor-actions">
+        <button type="button" class="btn btn-danger" id="btnDeleteDocumentation">Dokument löschen</button>
+      </div>
+    `;
+
+    editor.querySelectorAll('[data-doc-cmd]').forEach(btn => {
+      btn.addEventListener('mousedown', e => e.preventDefault());
+      btn.addEventListener('click', () => execDocumentationCommand(btn.dataset.docCmd));
+    });
+    editor.querySelectorAll('[data-crumb]').forEach(b => b.addEventListener('click', () => selectFolder(nodeValue(b.dataset.crumb))));
+    document.getElementById('documentationHeadingSelect').addEventListener('change', e => execDocumentationCommand('formatBlock', e.target.value));
+    document.getElementById('btnInsertDocumentationImage').addEventListener('click', () => uploadDocumentationFile(docId, 'image/*', true));
+    document.getElementById('btnDocHistory').addEventListener('click', () => openVersionHistory(docId));
+    const jiraBtn = document.getElementById('btnInsertJiraRef');
+    let pickerRange = null;
+    jiraBtn.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      const sel = window.getSelection();
+      pickerRange = sel.rangeCount ? sel.getRangeAt(0).cloneRange() : null;
+    });
+    jiraBtn.addEventListener('click', async () => { await ensureJiraMirror(); openJiraPicker(pickerRange); });
+
+    const contentEl = document.getElementById('documentationContentInput');
+    linkifyJiraRefs(contentEl);
+    decorateJiraRefs(contentEl);
+    ensureJiraMirror().then(() => { if (editor.dataset.docId === String(docId)) { linkifyJiraRefs(contentEl); decorateJiraRefs(contentEl); } });
+    contentEl.addEventListener('click', (e) => {
+      const ref = e.target.closest('a.jira-ref');
+      if (ref) { e.preventDefault(); showJiraPopover(ref); }
+      else closeJiraPopover();
+    });
+    contentEl.addEventListener('keydown', closeJiraPopover);
+    // Neue Absätze als <p> statt <div>
+    try { document.execCommand('defaultParagraphSeparator', false, 'p'); } catch {}
+    contentEl.addEventListener('paste', (e) => {
+      if (!e.clipboardData) return;
+      const html = pastedHtml(e.clipboardData);
+      if (html === null) return;
+      e.preventDefault();
+      if (html) document.execCommand('insertHTML', false, html);
+    });
+
+    let timer = null;
+    let running = false;
+    let queued = false;
+    let dirty = false;
+
+    const setStatus = (text, error = false) => {
+      const el = document.getElementById('documentationAutosaveStatus');
+      if (!el || editor.dataset.docId !== String(docId)) return;
+      el.textContent = text;
+      el.classList.toggle('is-error', error);
+    };
+
+    const saveNow = async () => {
+      clearTimeout(timer);
+      // Nur speichern, solange genau dieses Dokument im Editor steht
+      if (editor.dataset.docId !== String(docId) || !dirty) return;
+      if (running) { queued = true; return; }
+      const title = document.getElementById('documentationTitleInput').value.trim();
+      const content = sanitizeDocumentationHtml(cleanJiraRefs(document.getElementById('documentationContentInput').innerHTML));
+      const folderValue = document.getElementById('documentationFolderInput').value;
+      const folder_id = folderValue ? Number(folderValue) : null;
+      if (!title) { setStatus('Titel fehlt – nicht gespeichert', true); return; }
+
+      running = true;
+      dirty = false;
+      setStatus('⏳ Speichert …');
+      try {
+        const { res, data } = await fetchJson('/api/docs/' + docId, { method: 'PUT', body: JSON.stringify({ title, content, folder_id }) });
+        if (!res.ok || data?.error) { dirty = true; setStatus(data?.error || 'Speichern fehlgeschlagen', true); return; }
+        const item = docsState.docs.find(x => x.id === docId);
+        if (item) {
+          const moved = item.folder_id !== folder_id;
+          Object.assign(item, { title, content, folder_id, updated_at: data.updated_at || item.updated_at });
+          renderTree();
+          renderFiles();
+          if (moved) editor.querySelector('.dx-editor-crumbs').innerHTML = breadcrumbHTML(folder_id);
+          editor.querySelectorAll('[data-crumb]').forEach(b => b.addEventListener('click', () => selectFolder(nodeValue(b.dataset.crumb))));
+        }
+        setStatus('✓ Gespeichert');
+      } catch {
+        dirty = true;
+        setStatus('Speichern fehlgeschlagen', true);
+      } finally {
+        running = false;
+        if (queued) { queued = false; saveNow(); }
+      }
+    };
+
+    const schedule = (delay = 800) => {
+      dirty = true;
+      clearTimeout(timer);
+      setStatus('● Ungespeicherte Änderungen');
+      timer = setTimeout(saveNow, delay);
+    };
+
+    flushDocSave = saveNow;
+    document.getElementById('documentationTitleInput').addEventListener('input', () => schedule());
+    document.getElementById('documentationFolderInput').addEventListener('change', () => schedule(50));
+    const content = document.getElementById('documentationContentInput');
+    content.addEventListener('input', () => schedule());
+    content.addEventListener('blur', () => {
+      linkifyJiraRefs(content);
+      decorateJiraRefs(content);
+      if (dirty) schedule(150);
+    });
+    document.getElementById('btnDeleteDocumentation').addEventListener('click', () => deleteDoc(docId));
+  }
+
+  /* ---------- Anhänge ---------- */
+  async function uploadDocumentationFile(docId, accept = '*/*', insertImage = false) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = accept;
+    input.onchange = async () => {
+      if (!input.files?.[0]) return;
+      if (input.files[0].size > MAX_UPLOAD) { showToast('Die Datei ist größer als 50 MB.', true); return; }
+      const fd = new FormData();
+      fd.append('file', input.files[0]);
+      try {
+        const response = await fetch('/api/docs/' + docId + '/upload', {
+          method: 'POST',
+          body: fd,
+          headers: { 'Authorization': `Bearer ${state.token}` },
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || 'Upload fehlgeschlagen');
+        if (insertImage) {
+          const ed = document.getElementById('documentationContentInput');
+          ed.focus();
+          document.execCommand('insertImage', false, '/uploads/' + encodeURIComponent(data.filename));
+        }
+        showToast(insertImage ? 'Bild eingefügt.' : 'Datei hochgeladen.');
+        await loadAttachments(docId);
+      } catch (e) {
+        showToast(e.message || 'Upload fehlgeschlagen.', true);
+      }
+    };
+    input.click();
+  }
+
+  async function loadAttachments(docId) {
+    const box = document.getElementById('dxAttachments');
+    if (!box) return;
+    const { res, data } = await fetchJson('/api/docs/' + docId + '/files');
+    if (docsState.selectedDocId !== Number(docId)) return;
+    const files = res.ok && Array.isArray(data) ? data : [];
+    box.innerHTML = `
+      <div class="dx-panel-head dx-panel-head-sub">
+        <strong>Anhänge</strong>
+        <button type="button" class="btn" id="btnUploadDocumentationFile">+ Hochladen</button>
+      </div>
+      <div class="dx-attach-list">
+        ${files.length ? files.map(f => {
+          const mayDelete = isAdminUser() || Number(f.uploaded_by) === Number(state.currentUser?.id);
+          return `
+          <div class="dx-attach-row">
+            ${f.missing ? `<span class="dx-attach is-missing" title="Die Datei ist auf dem Server nicht mehr vorhanden">
+              ${ICON.clip}<span>${escapeHtml(f.original_name)}</span><small>fehlt – bitte neu hochladen</small>
+            </span>` : `<a class="dx-attach" href="/uploads/${encodeURIComponent(f.filename)}" target="_blank" rel="noopener" title="Hochgeladen von ${attr(personName(f.uploader_first_name, f.uploader_last_name, f.uploader_username))}">
+              ${ICON.clip}<span>${escapeHtml(f.original_name)}</span><small>${escapeHtml(formatSize(f.size))}</small>
+            </a>`}
+            ${mayDelete ? `<button type="button" class="btn btn-icon dx-attach-delete" data-delete-attachment="${f.id}" data-name="${attr(f.original_name)}" title="Anhang löschen" aria-label="Anhang ${attr(f.original_name)} löschen">✕</button>` : ''}
+          </div>`;
+        }).join('') : '<div class="dx-empty dx-empty-small">Keine Anhänge.</div>'}
+      </div>`;
+    document.getElementById('btnUploadDocumentationFile').addEventListener('click', () => uploadDocumentationFile(docId));
+    box.querySelectorAll('[data-delete-attachment]').forEach(btn => btn.addEventListener('click', async () => {
+      if (!confirm(`Anhang „${btn.dataset.name}“ löschen?\n\nIst er als Bild im Text eingefügt, wird das Bild dort danach nicht mehr angezeigt.`)) return;
+      const { res: r, data: d } = await fetchJson(`/api/docs/attachments/${btn.dataset.deleteAttachment}`, { method: 'DELETE' });
+      if (!r.ok) { showToast(d?.error || 'Anhang konnte nicht gelöscht werden.', true); return; }
+      showToast('Anhang gelöscht.');
+      loadAttachments(docId);
+    }));
+  }
+
+  /* ---------- Aktionen ---------- */
+  function targetFolderForNew() {
+    return docsState.selectedFolder === 'all' ? null : docsState.selectedFolder;
+  }
+
+  async function createFolder(parentId) {
+    const { res, data } = await fetchJson('/api/docs/folders', { method: 'POST', body: JSON.stringify({ name: 'Neuer Ordner', parent_id: parentId }) });
+    if (!res.ok || data?.error) { showToast(data?.error || 'Ordner konnte nicht erstellt werden.', true); return; }
+    if (parentId !== null) docsState.expanded.add(parentId);
+    await loadDocs();
+    startRenameFolder(Number(data.id));
+  }
+
+  function startRenameFolder(id) {
+    if (!folderById(id)) return;
+    expandPathTo(id);
+    docsState.renamingFolderId = id;
+    renderTree();
+  }
+
+  async function renameFolder(id, name) {
+    const { res, data } = await fetchJson(`/api/docs/folders/${id}`, { method: 'PUT', body: JSON.stringify({ name }) });
+    if (!res.ok || data?.error) showToast(data?.error || 'Umbenennen fehlgeschlagen.', true);
+    await loadDocs();
+    refreshEditorCrumbs();
+  }
+
+  async function moveFolder(id, parentId) {
+    const folder = folderById(id);
+    if (!folder || (folder.parent_id ?? null) === parentId) return;
+    if (parentId !== null && isSameOrDescendant(parentId, id)) {
+      showToast('Ein Ordner kann nicht in sich selbst verschoben werden.', true);
+      return;
+    }
+    const { res, data } = await fetchJson(`/api/docs/folders/${id}`, { method: 'PUT', body: JSON.stringify({ parent_id: parentId }) });
+    if (!res.ok || data?.error) { showToast(data?.error || 'Verschieben fehlgeschlagen.', true); return; }
+    if (parentId !== null) docsState.expanded.add(parentId);
+    showToast(`„${folder.name}“ verschoben nach „${folderLabel(parentId)}“`);
+    await loadDocs();
+    refreshEditorCrumbs();
+  }
+
+  async function deleteFolder(id) {
+    const folder = folderById(id);
+    if (!folder) return;
+    const count = countRecursive(id);
+    const subs = childFolders(id).length;
+    const target = folderLabel(folder.parent_id ?? null);
+    const extra = count || subs ? `\n\nDer Inhalt (${count} Eintr${count === 1 ? 'ag' : 'äge'}${subs ? `, ${subs} Unterordner` : ''}) wird nach „${target}“ verschoben.` : '';
+    if (!confirm(`Ordner „${folder.name}“ löschen?${extra}`)) return;
+    const { res, data } = await fetchJson(`/api/docs/folders/${id}`, { method: 'DELETE' });
+    if (!res.ok || data?.error) { showToast(data?.error || 'Ordner konnte nicht gelöscht werden.', true); return; }
+    if (docsState.selectedFolder === id) docsState.selectedFolder = folder.parent_id ?? null;
+    docsState.expanded.delete(id);
+    persistView();
+    showToast('Ordner gelöscht.');
+    await loadDocs();
+    refreshEditorCrumbs();
+  }
+
+  async function createDoc(folderId) {
+    await flushDocSave();
+    const { res, data } = await fetchJson('/api/docs', {
+      method: 'POST',
+      body: JSON.stringify({ title: 'Neues Dokument', content: '', category: 'project', folder_id: folderId }),
+    });
+    if (!res.ok || data?.error) { showToast(data?.error || 'Dokument konnte nicht erstellt werden.', true); return; }
+    if (docsState.selectedFolder !== 'all') docsState.selectedFolder = folderId;
+    await loadDocs();
+    await openDoc(data.id);
+    const title = document.getElementById('documentationTitleInput');
+    title?.focus();
+    title?.select();
+  }
+
+  async function moveDoc(docId, folderId) {
+    const doc = docsState.docs.find(d => d.id === docId);
+    if (!doc || doc.folder_id === folderId) return;
+    if (docsState.selectedDocId === docId) await flushDocSave();
+    const { res, data } = await fetchJson(`/api/docs/${docId}`, { method: 'PUT', body: JSON.stringify({ folder_id: folderId }) });
+    if (!res.ok || data?.error) { showToast(data?.error || 'Verschieben fehlgeschlagen.', true); return; }
+    doc.folder_id = folderId;
+    showToast(`„${doc.title}“ verschoben nach „${folderLabel(folderId)}“`);
+    renderTree();
+    renderFiles();
+    if (docsState.selectedDocId === docId) {
+      const select = document.getElementById('documentationFolderInput');
+      if (select) select.innerHTML = folderOptions(folderId);
+      refreshEditorCrumbs();
+    }
+  }
+
+  async function deleteDoc(docId) {
+    const doc = docsState.docs.find(d => d.id === docId);
+    if (!confirm(`Dokument „${doc?.title || ''}“ wirklich löschen?`)) return;
+    const { res, data } = await fetchJson(`/api/docs/${docId}`, { method: 'DELETE' });
+    if (!res.ok || data?.error) { showToast(data?.error || 'Dokument konnte nicht gelöscht werden.', true); return; }
+    if (docsState.selectedDocId === docId) {
+      docsState.selectedDocId = null;
+      showEmptyEditor();
+    }
+    persistView();
+    showToast('Dokument gelöscht.');
+    await loadDocs();
+  }
+
+  function refreshEditorCrumbs() {
+    const editor = document.getElementById('dxEditor');
+    const doc = docsState.docs.find(d => d.id === docsState.selectedDocId);
+    const crumbs = editor?.querySelector('.dx-editor-crumbs');
+    if (!doc || !crumbs || editor.dataset.docId !== String(doc.id)) return;
+    crumbs.innerHTML = breadcrumbHTML(doc.folder_id);
+    crumbs.querySelectorAll('[data-crumb]').forEach(b => b.addEventListener('click', () => selectFolder(nodeValue(b.dataset.crumb))));
+    const select = document.getElementById('documentationFolderInput');
+    if (select) select.innerHTML = folderOptions(doc.folder_id);
+  }
+
+  /* ---------- Kontextmenü (Rechtsklick) ---------- */
+  function menuItem(action, label, desc = '', danger = false) {
+    return `<button type="button" class="context-menu-item${danger ? ' context-menu-item-danger' : ''}" role="menuitem" data-menu="${action}">
+      <span class="context-menu-text"><span class="context-menu-label">${label}</span>${desc ? `<span class="context-menu-desc">${desc}</span>` : ''}</span></button>`;
+  }
+
+  let menuTarget = null;
+  function openMenu(x, y, target) {
+    const menu = document.getElementById('dxMenu');
+    menuTarget = target;
+    let items = '';
+    if (target.type === 'folder') {
+      items = menuItem('open', 'Öffnen') + menuItem('newFolder', 'Neuer Unterordner') + menuItem('newDoc', 'Neues Dokument hier') + menuItem('uploadHere', 'Dateien hochladen …')
+        + menuItem('rename', 'Umbenennen', 'F2') + menuItem('deleteFolder', 'Löschen', 'Inhalt wandert eine Ebene nach oben', true);
+    } else if (target.type === 'root') {
+      items = menuItem('newFolder', 'Neuer Ordner') + menuItem('newDoc', 'Neues Dokument') + menuItem('uploadHere', 'Dateien hochladen …');
+    } else if (target.type === 'doc') {
+      items = menuItem('openDoc', 'Öffnen') + menuItem('renameDoc', 'Umbenennen') + menuItem('showFolder', 'Speicherort öffnen')
+        + menuItem('deleteDoc', 'Löschen', '', true);
+    } else if (target.type === 'ffile') {
+      const file = docsState.files.find(f => f.id === target.id);
+      items = menuItem('openFile', 'Öffnen', canEditInOffice(file || {}) ? 'Im Office-Editor bearbeiten' : '') + menuItem('downloadFile', 'Herunterladen')
+        + menuItem('renameFile', 'Umbenennen') + menuItem('showFileFolder', 'Speicherort öffnen')
+        + (file?.can_delete ? menuItem('deleteFile', 'Löschen', '', true) : '');
+    } else return;
+    menu.innerHTML = items;
+    menu.hidden = false;
+    const w = menu.offsetWidth, h = menu.offsetHeight;
+    menu.style.left = `${Math.min(x, window.innerWidth - w - 8)}px`;
+    menu.style.top = `${Math.min(y, window.innerHeight - h - 8)}px`;
+    menu.querySelector('.context-menu-item')?.focus();
+  }
+
+  function closeMenu() {
+    const menu = document.getElementById('dxMenu');
+    if (menu) menu.hidden = true;
+    menuTarget = null;
+  }
+
+  async function onMenuAction(action) {
+    const t = menuTarget;
+    closeMenu();
+    if (!t) return;
+    if (action === 'open') selectFolder(t.id);
+    else if (action === 'newFolder') createFolder(t.type === 'root' ? null : t.id);
+    else if (action === 'newDoc') createDoc(t.type === 'root' ? null : t.id);
+    else if (action === 'rename') startRenameFolder(t.id);
+    else if (action === 'deleteFolder') deleteFolder(t.id);
+    else if (action === 'openDoc') openDoc(t.id);
+    else if (action === 'renameDoc') {
+      await openDoc(t.id);
+      const title = document.getElementById('documentationTitleInput');
+      title?.focus();
+      title?.select();
+    } else if (action === 'showFolder') {
+      const doc = docsState.docs.find(d => d.id === t.id);
+      selectFolder(doc?.folder_id ?? null);
+    } else if (action === 'deleteDoc') deleteDoc(t.id);
+    else if (action === 'uploadHere') pickAndUpload(t.type === 'root' ? null : t.id);
+    else if (action === 'openFile') openFile(t.id);
+    else if (action === 'downloadFile') {
+      const file = docsState.files.find(f => f.id === t.id);
+      if (file) {
+        const a = document.createElement('a');
+        a.href = `/uploads/${encodeURIComponent(file.filename)}`;
+        a.download = file.original_name;
+        a.click();
+      }
+    } else if (action === 'renameFile') {
+      await openFile(t.id);
+      const input = document.getElementById('dxFileName');
+      input?.focus();
+      input?.select();
+    } else if (action === 'showFileFolder') {
+      const file = docsState.files.find(f => f.id === t.id);
+      selectFolder(file?.folder_id ?? null);
+    } else if (action === 'deleteFile') deleteFile(t.id);
+  }
+
+  function menuTargetFor(el) {
+    const row = el.closest('.dx-row, .dx-file');
+    if (!row) return null;
+    if (row.dataset.doc) return { type: 'doc', id: Number(row.dataset.doc) };
+    if (row.dataset.ffile) return { type: 'ffile', id: Number(row.dataset.ffile) };
+    const value = nodeValue(row.dataset.node);
+    if (value === null) return { type: 'root' };
+    if (typeof value === 'number') return { type: 'folder', id: value };
+    return null;
+  }
+
+  /* ---------- Drag & Drop ---------- */
+  const DRAG_TYPE = 'application/x-portal-doc';
+  let dragPayload = null;
+  let hoverExpandTimer = null;
+
+  function dropTargetFor(el) {
+    const row = el.closest('.dx-row, .dx-file[data-open-folder]');
+    if (!row) return undefined;
+    const value = nodeValue(row.dataset.node);
+    return value === 'all' ? undefined : value;
+  }
+
+  function canDrop(payload, target) {
+    if (!payload || target === undefined) return false;
+    if (payload.type === 'doc' || payload.type === 'ffile' || payload.type === 'upload') return true;
+    if (payload.type === 'folder') return target === null || !isSameOrDescendant(target, payload.id);
+    return false;
+  }
+
+  function bindDragAndDrop(container) {
+    container.addEventListener('dragstart', (e) => {
+      const el = e.target.closest('[draggable="true"]');
+      if (!el) return;
+      dragPayload = el.dataset.doc ? { type: 'doc', id: Number(el.dataset.doc) }
+        : el.dataset.ffile ? { type: 'ffile', id: Number(el.dataset.ffile) }
+        : { type: 'folder', id: Number(el.dataset.node) };
+      e.dataTransfer.setData(DRAG_TYPE, JSON.stringify(dragPayload));
+      e.dataTransfer.effectAllowed = 'move';
+      el.classList.add('is-dragging');
+    });
+    container.addEventListener('dragend', (e) => {
+      e.target.closest?.('[draggable="true"]')?.classList.remove('is-dragging');
+      document.querySelectorAll('.is-drop').forEach(x => x.classList.remove('is-drop'));
+      dragPayload = null;
+      clearTimeout(hoverExpandTimer);
+    });
+    // Dateien vom Rechner: über einem Ordner -> dorthin, sonst in den gerade geöffneten Ordner
+    const isOsFileDrag = (e) => !dragPayload && [...(e.dataTransfer?.types || [])].includes('Files');
+    const osDropTarget = (e) => {
+      const target = dropTargetFor(e.target);
+      if (target !== undefined) return target;
+      if (container.id === 'dxFiles' || e.target.closest('.dx-panel-files')) return docsState.selectedFolder === 'all' ? null : docsState.selectedFolder;
+      return undefined;
+    };
+    container.addEventListener('dragover', (e) => {
+      if (isOsFileDrag(e)) {
+        const target = osDropTarget(e);
+        if (target === undefined) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+        document.querySelectorAll('.is-drop').forEach(x => x.classList.remove('is-drop'));
+        const row = e.target.closest('.dx-row, .dx-file[data-open-folder]');
+        (row || container).classList.add('is-drop');
+        return;
+      }
+      const target = dropTargetFor(e.target);
+      if (!canDrop(dragPayload, target)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const row = e.target.closest('.dx-row, .dx-file');
+      if (!row.classList.contains('is-drop')) {
+        document.querySelectorAll('.is-drop').forEach(x => x.classList.remove('is-drop'));
+        row.classList.add('is-drop');
+        clearTimeout(hoverExpandTimer);
+        // Wie im Explorer: kurz über einem zugeklappten Ordner verharren klappt ihn auf
+        if (typeof target === 'number' && row.classList.contains('dx-row') && !docsState.expanded.has(target) && childFolders(target).length) {
+          hoverExpandTimer = setTimeout(() => { docsState.expanded.add(target); renderTree(); }, 700);
+        }
+      }
+    });
+    container.addEventListener('dragleave', (e) => {
+      const row = e.target.closest('.dx-row, .dx-file');
+      if (row && !row.contains(e.relatedTarget)) row.classList.remove('is-drop');
+      if (!container.contains(e.relatedTarget)) container.classList.remove('is-drop');
+    });
+    container.addEventListener('drop', (e) => {
+      document.querySelectorAll('.is-drop').forEach(x => x.classList.remove('is-drop'));
+      clearTimeout(hoverExpandTimer);
+      if (isOsFileDrag(e)) {
+        const target = osDropTarget(e);
+        if (target === undefined) return;
+        e.preventDefault();
+        uploadFolderFiles(e.dataTransfer.files, target);
+        return;
+      }
+      const target = dropTargetFor(e.target);
+      const payload = dragPayload;
+      if (!canDrop(payload, target)) return;
+      e.preventDefault();
+      if (payload.type === 'doc') moveDoc(payload.id, target);
+      else if (payload.type === 'ffile') moveFile(payload.id, target);
+      else moveFolder(payload.id, target);
+    });
+  }
+
+  /* ---------- Seite ---------- */
+  function renderDocumentationPage() {
+    document.body.classList.add('page-wide');
+    const app = document.getElementById('app');
+    app.innerHTML = `
+      ${headerHTML({ title: appTitle('Dokumentation'), current: 'docs' })}
+
+      <main class="documentation-page dx-page">
+        <div class="dx-layout">
+          <aside class="dx-panel dx-panel-tree" aria-label="Ordner">
+            <div class="dx-panel-head">
+              <strong>Ordner</strong>
+              <button type="button" class="btn" id="btnDxNewFolder" title="Neuer Ordner im ausgewählten Ordner">+ Ordner</button>
+            </div>
+            <div class="dx-tree" id="dxTree" role="tree" aria-label="Ordnerstruktur"></div>
+            <p class="dx-hint">Rechtsklick für mehr Optionen · Ordner, Dokumente und Dateien per Drag &amp; Drop verschieben · Dateien vom Rechner einfach hierher ziehen</p>
+          </aside>
+
+          <section class="dx-panel dx-panel-editor docs-page-editor" id="dxEditor" aria-label="Dokument"></section>
+
+          <aside class="dx-panel dx-panel-files" aria-label="Dateien">
+            <div class="dx-panel-head">
+              <strong>Dateien</strong>
+              <div class="dx-head-actions">
+                <button type="button" class="btn" id="btnDxNewFolderHere" title="Neuer Unterordner hier">+ Ordner</button>
+                <button type="button" class="btn" id="btnDxUpload" title="PDF, Word, Excel … in diesen Ordner hochladen (max. 50 MB)">⬆ Datei</button>
+                <button type="button" class="btn btn-primary" id="btnDxNewDoc">+ Dokument</button>
+              </div>
+            </div>
+            <div class="dx-files-crumbs" id="dxFilesCrumbs"></div>
+            <div class="dx-search">
+              <input type="search" id="dxSearch" placeholder="Alle Dokumente durchsuchen" aria-label="Dokumente durchsuchen">
+            </div>
+            <div class="dx-files" id="dxFiles" role="list"></div>
+            <div class="dx-attachments" id="dxAttachments"></div>
+          </aside>
+        </div>
+      </main>
+      <div id="dxMenu" class="context-menu" role="menu" hidden></div>
+      <div id="dxModal" class="modal-overlay" hidden>
+        <div class="modal dx-modal" role="dialog" aria-modal="true" id="dxModalBody"></div>
+      </div>
+    `;
+    bindHeader();
+    showEmptyEditor();
+
+    const tree = document.getElementById('dxTree');
+    const files = document.getElementById('dxFiles');
+    tree.addEventListener('click', (e) => {
+      const toggle = e.target.closest('[data-toggle]');
+      const row = e.target.closest('.dx-row');
+      if (!row) return;
+      const value = nodeValue(row.dataset.node);
+      if (toggle && typeof value === 'number' && !toggle.classList.contains('is-empty')) { toggleFolder(value); return; }
+      selectFolder(value, { focus: true });
+    });
+    tree.addEventListener('dblclick', (e) => {
+      const row = e.target.closest('.dx-row');
+      const value = row && nodeValue(row.dataset.node);
+      if (typeof value === 'number' && childFolders(value).length && !e.target.closest('[data-toggle]')) toggleFolder(value);
+    });
+    tree.addEventListener('keydown', onTreeKeydown);
+
+    const openFileRow = (row) => {
+      if (row.dataset.doc) openDoc(Number(row.dataset.doc));
+      else if (row.dataset.ffile) openFile(Number(row.dataset.ffile));
+      else if (row.dataset.openFolder) selectFolder(Number(row.dataset.openFolder));
+    };
+    files.addEventListener('click', (e) => {
+      const row = e.target.closest('.dx-file');
+      if (row) openFileRow(row);
+    });
+    files.addEventListener('keydown', (e) => {
+      const row = e.target.closest('.dx-file');
+      if (!row) return;
+      if (e.key === 'Enter') { e.preventDefault(); openFileRow(row); }
+      else if (e.key === 'Delete' && row.dataset.doc) { e.preventDefault(); deleteDoc(Number(row.dataset.doc)); }
+      else if (e.key === 'Delete' && row.dataset.ffile) { e.preventDefault(); deleteFile(Number(row.dataset.ffile)); }
+      else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const rows = [...files.querySelectorAll('.dx-file')];
+        rows[Math.max(0, Math.min(rows.length - 1, rows.indexOf(row) + (e.key === 'ArrowDown' ? 1 : -1)))]?.focus();
+      }
+    });
+    document.getElementById('dxFilesCrumbs').addEventListener('click', (e) => {
+      const crumb = e.target.closest('[data-crumb]');
+      if (crumb) selectFolder(nodeValue(crumb.dataset.crumb));
+    });
+
+    for (const el of [tree, files]) {
+      el.addEventListener('contextmenu', (e) => {
+        const target = menuTargetFor(e.target);
+        if (!target) return;
+        e.preventDefault();
+        openMenu(e.clientX, e.clientY, target);
+      });
+      // Rechts die ganze Spalte als Ablagefläche (inklusive Leerraum unter der Liste)
+      bindDragAndDrop(el === files ? el.closest('.dx-panel-files') : el);
+    }
+
+    const menu = document.getElementById('dxMenu');
+    menu.addEventListener('click', (e) => {
+      const item = e.target.closest('[data-menu]');
+      if (item) onMenuAction(item.dataset.menu);
+    });
+    menu.addEventListener('keydown', (e) => {
+      const items = [...menu.querySelectorAll('.context-menu-item')];
+      const idx = items.indexOf(document.activeElement);
+      if (e.key === 'Escape') { e.preventDefault(); closeMenu(); }
+      else if (e.key === 'ArrowDown') { e.preventDefault(); items[(idx + 1) % items.length]?.focus(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); items[(idx - 1 + items.length) % items.length]?.focus(); }
+    });
+    document.addEventListener('click', (e) => { if (!e.target.closest('#dxMenu')) closeMenu(); });
+    window.addEventListener('scroll', closeMenu, { passive: true });
+    window.addEventListener('resize', closeMenu);
+
+    document.getElementById('btnDxNewFolder').addEventListener('click', () => createFolder(targetFolderForNew()));
+    document.getElementById('btnDxNewFolderHere').addEventListener('click', () => createFolder(targetFolderForNew()));
+    document.getElementById('btnDxNewDoc').addEventListener('click', () => createDoc(targetFolderForNew()));
+    document.getElementById('btnDxUpload').addEventListener('click', () => pickAndUpload(targetFolderForNew()));
+    document.getElementById('dxSearch').addEventListener('input', (e) => { docsState.search = e.target.value; renderFiles(); });
+    window.addEventListener('beforeunload', () => { flushDocSave(); });
+    document.getElementById('dxModal').addEventListener('click', (e) => { if (e.target.id === 'dxModal') closeModal(); });
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('#dxJiraPop') && !e.target.closest('a.jira-ref')) closeJiraPopover();
+    });
+    window.addEventListener('scroll', closeJiraPopover, true);
+
+    // Treffer der globalen Suche direkt hier öffnen
+    onSearchNavigate((hit) => {
+      if (hit.type === 'doc') { openDoc(Number(hit.id)); return true; }
+      if (hit.type === 'folder') { selectFolder(Number(hit.id)); return true; }
+      if (hit.type === 'file') { openFile(Number(hit.id)); return true; }
+      return false;
+    });
+
+    // Direktlinks: ?doc=ID, ?folder=ID, ?new=1 (z. B. vom Dashboard)
+    const params = new URLSearchParams(window.location.search);
+    const last = readStored('docsLast', {});
+    docsState.selectedFolder = last.folder === undefined ? null : last.folder;
+    const docParam = Number(params.get('doc')) || null;
+    const folderParam = Number(params.get('folder')) || null;
+    const fileParam = Number(params.get('file')) || null;
+    if (params.toString()) history.replaceState(null, '', '/dokumentation');
+    loadDocs().then(() => {
+      if (folderParam && folderById(folderParam)) selectFolder(folderParam);
+      if (params.get('new') === '1') { createDoc(targetFolderForNew()); return; }
+      const fileId = fileParam || (!docParam && last.file ? Number(last.file) : null);
+      const file = docsState.files.find(f => f.id === fileId);
+      if (file) {
+        if (fileParam && docsState.selectedFolder !== 'all') selectFolder(file.folder_id);
+        openFile(file.id);
+        return;
+      }
+      const docId = docParam || (last.doc ? Number(last.doc) : null);
+      const doc = docsState.docs.find(d => d.id === docId);
+      if (doc) {
+        if (docParam && docsState.selectedFolder !== 'all') selectFolder(doc.folder_id);
+        openDoc(doc.id);
+      }
+    });
+  }
+
+  if (await requireSession()) renderDocumentationPage();
+</script>
+</body>
+</html>

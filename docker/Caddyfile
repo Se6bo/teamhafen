@@ -1,0 +1,16 @@
+# Reverse Proxy für Teamhafen (Profil "https"). Für einen eigenen Caddy auf dem Server
+# denselben Block übernehmen und app:80 bzw. collabora:9980 durch 127.0.0.1:8080 bzw. 127.0.0.1:9980 ersetzen.
+{$PUBLIC_HOST} {
+	# Office (Collabora): Admin Konsole von außen gesperrt
+	@collabora_admin path /browser/dist/admin/* /cool/adminws* /cool/getMetrics*
+	@collabora path /browser/* /hosting/discovery /hosting/capabilities /cool/*
+	handle @collabora_admin {
+		respond 403
+	}
+	handle @collabora {
+		reverse_proxy collabora:9980
+	}
+	handle {
+		reverse_proxy app:80
+	}
+}

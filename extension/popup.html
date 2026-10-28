@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<title>__PORTAL_NAME__ Tresor</title>
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="icons/icon32.png" width="18" height="18" alt="" class="brand-icon">
+      <span>__PORTAL_NAME__ Tresor</span>
+    </div>
+    <button type="button" id="logoutBtn" class="link-btn hidden">Abmelden</button>
+  </header>
+
+  <main>
+    <!-- Login-Ansicht -->
+    <section id="view-login" class="view hidden">
+      <form id="loginForm" novalidate>
+        <div class="field">
+          <label for="username">Benutzername</label>
+          <input id="username" name="username" type="text" autocomplete="username" required>
+        </div>
+        <div class="field">
+          <label for="password">Passwort</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <p id="loginError" class="error-text hidden" role="alert"></p>
+        <button type="submit" id="loginSubmit" class="btn btn-primary">Anmelden</button>
+      </form>
+
+      <details class="vault-url-box">
+        <summary>Tresor-Adresse</summary>
+        <div class="field">
+          <label for="vaultUrl">Adresse des Tresors</label>
+          <input id="vaultUrl" name="vaultUrl" type="text" inputmode="url" autocomplete="off">
+        </div>
+        <button type="button" id="saveVaultUrl" class="btn btn-ghost">Speichern</button>
+        <p id="vaultUrlMsg" class="hint-text hidden"></p>
+      </details>
+    </section>
+
+    <!-- Ladezustand -->
+    <section id="view-loading" class="view hidden">
+      <p class="hint-text">Lade Einträge …</p>
+    </section>
+
+    <!-- Berechtigung fehlt -->
+    <section id="view-permission" class="view hidden">
+      <p class="error-text" id="permissionText"></p>
+      <button type="button" id="grantPermissionBtn" class="btn btn-primary">Zugriff erlauben</button>
+    </section>
+
+    <!-- Allgemeiner Fehler -->
+    <section id="view-error" class="view hidden">
+      <p class="error-text" id="errorText"></p>
+      <button type="button" id="retryBtn" class="btn btn-ghost">Erneut versuchen</button>
+    </section>
+
+    <!-- Ergebnis-Ansicht -->
+    <section id="view-results" class="view hidden">
+      <div id="siteMatches" class="site-matches"></div>
+
+      <div class="search-box">
+        <input id="searchInput" type="search" placeholder="Einträge durchsuchen …" autocomplete="off">
+      </div>
+      <ul id="entryList" class="entry-list"></ul>
+      <p id="emptyState" class="hint-text hidden">Keine Einträge im Tresor.</p>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,1379 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sprints</title>
+<script src="/config.js"></script>
+<link rel="stylesheet" href="/assets/common.css">
+<link rel="stylesheet" href="/assets/sprints.css">
+<script>try { if (localStorage.getItem('darkMode') === 'true') document.documentElement.setAttribute('data-theme', 'dark'); } catch {}</script>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="toastRegion" class="toast-region" aria-live="polite"></div>
+<script type="module">
+  import {
+    APP,
+    appTitle,
+    hasModule,
+    bindHeader,
+    onSearchNavigate,
+    closeDialog,
+    errorMessage,
+    escapeHtml,
+    fetchJson,
+    headerHTML,
+    openDialog,
+    requireSession,
+    showToast,
+    state,
+  } from '/assets/common.js';
+
+  /* ---------- Sprints & Aufgaben (Jira) ---------- */
+  const JIRA_FILTER_DEFAULTS = { status: 'all', type: 'all', priority: 'all', label: 'all' };
+  function readJiraFilters() {
+    try { return { ...JIRA_FILTER_DEFAULTS, ...JSON.parse(localStorage.getItem('jiraFilters') || '{}') }; }
+    catch { return { ...JIRA_FILTER_DEFAULTS }; }
+  }
+
+  // Jira kennt nur eine Subtask-Ebene. Tiefere Unteraufgaben sind normale Subtasks der Hauptaufgabe
+  // mit dem Label "teil-von-<Schlüssel>"; das Portal zeigt sie darüber verschachtelt an.
+  const JIRA_PART_PREFIX = 'teil-von-';
+  function jiraPartOf(issue) {
+    const label = (issue?.labels || []).find(l => l.toLowerCase().startsWith(JIRA_PART_PREFIX));
+    return label ? label.slice(JIRA_PART_PREFIX.length).toUpperCase() : null;
+  }
+  function jiraVisibleLabels(labels) {
+    return (labels || []).filter(l => !l.toLowerCase().startsWith(JIRA_PART_PREFIX));
+  }
+  function jiraNormalizeLabels(value) {
+    return (Array.isArray(value) ? value : String(value || '').split(','))
+      .map(l => String(l).trim().replace(/\s+/g, '-')).filter(Boolean).sort().join(',');
+  }
+
+  const jiraState = {
+    meta: null,
+    sprints: [],
+    view: localStorage.getItem('jiraView') || 'board',
+    boardSprintId: null,
+    issuesBySprint: {},
+    backlog: [],
+    mine: [],
+    epics: [],
+    filterAssignee: 'all',
+    filters: readJiraFilters(),
+    search: '',
+    showSubtasks: localStorage.getItem('jiraShowSubtasks') !== 'false',
+    pollTimer: null,
+    statusTimer: null,
+    // Synchronisierter Spiegel aller Aufgaben (Schlüssel -> Aufgabe) und Stand der letzten Abfrage
+    store: new Map(),
+    rev: 0,
+    sync: null,
+    loaded: false,
+    openParents: [],
+    loadSeq: 0,
+    loading: false,
+    error: null,
+  };
+
+  function jiraAttr(value) {
+    return escapeHtml(value).replace(/"/g, '&quot;');
+  }
+
+  async function jiraApi(path, options = {}) {
+    const init = { ...options };
+    if (init.body !== undefined && typeof init.body !== 'string') init.body = JSON.stringify(init.body);
+    const { res, data } = await fetchJson('/api/jira' + path, init);
+    if (!res.ok) throw new Error(errorMessage(data, `Fehler ${res.status}`));
+    return data;
+  }
+
+  function jiraInitials(name) {
+    return String(name || '?').split(/\s+/).filter(Boolean).slice(0, 2).map(p => p[0].toUpperCase()).join('') || '?';
+  }
+
+  function jiraAvatar(user, size = 24) {
+    const style = `width:${size}px;height:${size}px;`;
+    if (!user) return `<span class="jira-avatar is-empty" style="${style}" title="Nicht zugewiesen">?</span>`;
+    const title = jiraAttr(user.displayName);
+    if (user.avatarUrl && /^https:\/\//.test(user.avatarUrl)) {
+      return `<span class="jira-avatar" style="${style}" title="${title}"><img src="${jiraAttr(user.avatarUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer"></span>`;
+    }
+    return `<span class="jira-avatar" style="${style}" title="${title}">${escapeHtml(jiraInitials(user.displayName))}</span>`;
+  }
+
+  function jiraTypeBadge(type) {
+    const name = (type?.name || '').toLowerCase();
+    let cls = 't-task', label = 'T';
+    if (type?.subtask || name.includes('sub')) { cls = 't-subtask'; label = 'ST'; }
+    else if (name.includes('bug')) { cls = 't-bug'; label = 'B'; }
+    else if (name.includes('story')) { cls = 't-story'; label = 'S'; }
+    else if (name.includes('epic')) { cls = 't-epic'; label = 'E'; }
+    return `<span class="jira-type ${cls}" title="${jiraAttr(type?.name || '')}">${label}</span>`;
+  }
+
+  const JIRA_PRIO_LABELS = { highest: 'Kritisch', high: 'Hoch', medium: 'Mittel', low: 'Niedrig', lowest: 'Sehr niedrig' };
+  function jiraPrioLabel(priority) {
+    if (!priority?.name) return '';
+    return JIRA_PRIO_LABELS[priority.name.toLowerCase()] || priority.name;
+  }
+  function jiraPrio(priority) {
+    if (!priority?.name) return '';
+    const key = priority.name.toLowerCase();
+    const arrow = key.includes('high') ? '↑' : key.includes('low') ? '↓' : '=';
+    return `<span class="jira-prio p-${jiraAttr(key)}" title="Priorität: ${jiraAttr(jiraPrioLabel(priority))}">${arrow}</span>`;
+  }
+
+  function jiraStatusPill(status) {
+    if (!status) return '';
+    return `<span class="jira-status c-${jiraAttr(status.category)}">${escapeHtml(status.name)}</span>`;
+  }
+
+  function jiraDate(value, withTime = false) {
+    if (!value) return '—';
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return value;
+    return new Intl.DateTimeFormat('de-DE', withTime ? { dateStyle: 'medium', timeStyle: 'short' } : { dateStyle: 'medium' }).format(d);
+  }
+
+  function jiraDateInput(value) {
+    if (!value) return '';
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return '';
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  function jiraDateToIso(value, hour) {
+    if (!value) return null;
+    const [y, m, d] = value.split('-').map(Number);
+    return new Date(y, m - 1, d, hour, 0, 0).toISOString();
+  }
+
+  function jiraSprintRange(sprint) {
+    if (!sprint.startDate && !sprint.endDate) return 'Noch kein Zeitraum';
+    return `${jiraDate(sprint.startDate)} – ${jiraDate(sprint.endDate)}`;
+  }
+
+  function jiraDaysLeft(sprint) {
+    if (!sprint?.endDate) return '';
+    const days = Math.ceil((new Date(sprint.endDate) - Date.now()) / 86400000);
+    if (days < 0) return `seit ${-days} Tag${days === -1 ? '' : 'en'} überfällig`;
+    if (days === 0) return 'endet heute';
+    return `noch ${days} Tag${days === 1 ? '' : 'e'}`;
+  }
+
+  function jiraUsers() {
+    return jiraState.meta?.users || [];
+  }
+
+  function jiraUserOptions(selectedId, { emptyLabel = 'Nicht zugewiesen' } = {}) {
+    return `<option value="">${escapeHtml(emptyLabel)}</option>` + jiraUsers()
+      .map(u => `<option value="${jiraAttr(u.accountId)}" ${u.accountId === selectedId ? 'selected' : ''}>${escapeHtml(u.displayName)}</option>`)
+      .join('');
+  }
+
+  function jiraOpenSprints() {
+    return jiraState.sprints.filter(s => s.state === 'active' || s.state === 'future');
+  }
+
+  function jiraActiveSprints() {
+    return jiraState.sprints.filter(s => s.state === 'active');
+  }
+
+  function jiraFilter(issues) {
+    const q = jiraState.search.trim().toLowerCase();
+    const myId = jiraState.meta?.me?.accountId;
+    return issues.filter(issue => {
+      if (!jiraState.showSubtasks && issue.type?.subtask) return false;
+      const a = jiraState.filterAssignee;
+      if (a === 'me' && issue.assignee?.accountId !== myId) return false;
+      if (a === 'none' && issue.assignee) return false;
+      if (a !== 'all' && a !== 'me' && a !== 'none' && issue.assignee?.accountId !== a) return false;
+      if (q && !(`${issue.key} ${issue.summary} ${issue.labels.join(' ')} ${issue.parent?.summary || ''}`.toLowerCase().includes(q))) return false;
+      const f = jiraState.filters;
+      if (f.status === 'open' && issue.status?.category === 'done') return false;
+      if (f.status.startsWith('cat:') && issue.status?.category !== f.status.slice(4)) return false;
+      if (f.status.startsWith('id:') && String(issue.status?.id) !== f.status.slice(3)) return false;
+      if (f.type !== 'all' && issue.type?.name !== f.type) return false;
+      if (f.priority !== 'all' && String(issue.priority?.id) !== f.priority) return false;
+      if (f.label !== 'all' && !(issue.labels || []).includes(f.label)) return false;
+      return true;
+    });
+  }
+
+  function jiraFindIssue(key) {
+    return jiraState.derived?.find(i => i.key === key) || null;
+  }
+
+  // Änderungen vom Server in den lokalen Spiegel übernehmen
+  function jiraApplyChanges(changes) {
+    if (changes.complete) jiraState.store.clear();
+    for (const issue of changes.issues || []) jiraState.store.set(issue.key, issue);
+    for (const key of changes.deleted || []) jiraState.store.delete(key);
+    if (changes.sprints) jiraState.sprints = changes.sprints;
+    jiraState.rev = changes.rev;
+    jiraState.sync = changes.sync || jiraState.sync;
+    jiraState.loaded = true;
+  }
+
+  // Alle Ansichten (Board, Backlog, Meine Aufgaben, Epics) lokal aus dem Spiegel berechnen – ohne Anfrage an Jira
+  function jiraRebuildViews() {
+    const sprintById = new Map(jiraState.sprints.map(sp => [sp.id, sp]));
+    // Logischer Elternteil: Label "teil-von-X" (tiefere Ebenen) oder bei Subtasks die Jira-Hauptaufgabe
+    const logicalParentOf = (issue) => {
+      const part = jiraPartOf(issue);
+      if (part && part !== issue.key && jiraState.store.has(part)) return part;
+      return issue.type?.subtask ? (issue.parent?.key || null) : null;
+    };
+    const children = new Map();
+    for (const issue of jiraState.store.values()) {
+      const parentKey = logicalParentOf(issue);
+      if (!parentKey) continue;
+      if (!children.has(parentKey)) children.set(parentKey, []);
+      children.get(parentKey).push(issue);
+    }
+    const derived = [...jiraState.store.values()].map(issue => {
+      const sprints = (issue.sprintIds || []).map(id => sprintById.get(id)).filter(Boolean);
+      const sprint = sprints.find(sp => sp.state === 'active') || sprints.find(sp => sp.state === 'future') || null;
+      const kids = children.get(issue.key) || [];
+      const parentIssue = issue.parent ? jiraState.store.get(issue.parent.key) : null;
+      const logicalParentKey = logicalParentOf(issue);
+      const logicalParent = logicalParentKey ? jiraState.store.get(logicalParentKey) : null;
+      return {
+        ...issue,
+        logicalParentKey,
+        displayParent: logicalParent
+          ? { key: logicalParent.key, summary: logicalParent.summary }
+          : (issue.parent ? { key: issue.parent.key, summary: parentIssue?.summary || issue.parent.summary } : null),
+        sprint: sprint ? { id: sprint.id, name: sprint.name, state: sprint.state } : null,
+        subtaskCount: kids.length,
+        subtasksDone: kids.filter(k => k.status?.category === 'done').length,
+        parent: issue.parent ? { ...issue.parent, summary: parentIssue?.summary || issue.parent.summary } : null,
+      };
+    }).sort((a, b) => (a.rank || '').localeCompare(b.rank || '') || a.key.localeCompare(b.key, 'de', { numeric: true }));
+
+    const open = jiraOpenSprints();
+    if (!jiraState.sprints.some(sp => sp.id === jiraState.boardSprintId)) {
+      jiraState.boardSprintId = (jiraActiveSprints()[0] || open[0])?.id ?? null;
+    }
+    const issuesBySprint = {};
+    for (const sp of open) issuesBySprint[sp.id] = derived.filter(i => i.sprint?.id === sp.id);
+    const notDone = i => i.status?.category !== 'done';
+    const isEpic = i => i.type?.name === 'Epic' || (i.type && !i.type.subtask && i.type.hierarchyLevel > 0);
+    const myId = jiraState.meta?.me?.accountId;
+    const byCreated = (a, b) => String(a.created || '').localeCompare(String(b.created || ''));
+
+    jiraState.derived = derived;
+    jiraState.issuesBySprint = issuesBySprint;
+    jiraState.backlog = derived.filter(i => !i.sprint && notDone(i) && i.type?.name !== 'Epic');
+    jiraState.mine = myId
+      ? derived.filter(i => i.assignee?.accountId === myId && notDone(i))
+        .sort((a, b) => (Number(a.priority?.id) || 99) - (Number(b.priority?.id) || 99) || String(b.updated || '').localeCompare(String(a.updated || '')))
+      : [];
+    jiraState.epics = derived.filter(i => i.type?.name === 'Epic').sort(byCreated);
+    jiraState.openParents = derived.filter(i => notDone(i) && !i.type?.subtask && !isEpic(i)).sort(byCreated).reverse();
+  }
+
+  function jiraRelative(iso) {
+    if (!iso) return 'noch nie';
+    const sec = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+    if (sec < 10) return 'gerade eben';
+    if (sec < 60) return `vor ${sec} s`;
+    const min = Math.round(sec / 60);
+    if (min < 60) return `vor ${min} min`;
+    return `vor ${Math.round(min / 60)} h`;
+  }
+
+  function jiraRenderSyncStatus() {
+    const el = document.getElementById('jiraSyncStatus');
+    if (!el) return;
+    const sync = jiraState.sync;
+    if (!sync) { el.textContent = ''; return; }
+    el.classList.toggle('is-error', Boolean(sync.error));
+    el.textContent = sync.error ? '⚠ Sync-Fehler' : (sync.running ? '⟳ Synchronisiert …' : `✓ Synchronisiert ${jiraRelative(sync.lastSyncAt)}`);
+    el.title = sync.error
+      ? `Letzter Abgleich mit Jira fehlgeschlagen: ${sync.error}`
+      : `Der Server gleicht alle ${sync.intervalSeconds} s mit Jira ab, solange jemand das Portal nutzt.`;
+  }
+
+  /* ----- Seite ----- */
+  function renderJiraPage() {
+    document.body.classList.add('page-wide');
+    const app = document.getElementById('app');
+    app.innerHTML = `
+      ${headerHTML({ title: appTitle('Sprints'), current: 'sprints', controls: `
+          <a class="btn" id="btnJiraOpen" href="#" target="_blank" rel="noopener" hidden>In Jira öffnen ↗</a>
+          <button type="button" class="btn" id="btnJiraMapping" hidden>Zuordnung</button>
+          <span class="jira-sync-status" id="jiraSyncStatus" aria-live="polite"></span>
+          <button type="button" class="btn" id="btnJiraRefresh" title="Sofort mit Jira abgleichen">Synchronisieren</button>` })}
+
+      <main class="jira-page" id="jiraPage">
+        <section class="jira-head">
+          <div>
+            <div class="documentation-eyebrow" id="jiraEyebrow">NEXT IT · SPRINTS & AUFGABEN</div>
+            <h2 id="jiraHeadTitle">Sprints & Aufgaben</h2>
+            <p id="jiraHeadSub">Verbindung zu Jira wird aufgebaut …</p>
+            <div class="jira-progress" id="jiraHeadProgress" hidden></div>
+          </div>
+          <div class="jira-head-actions">
+            <button type="button" class="btn" id="btnJiraNewSprint">+ Sprint</button>
+            <button type="button" class="btn btn-primary" id="btnJiraNewIssue">+ Aufgabe</button>
+          </div>
+        </section>
+
+        <div id="jiraNotice"></div>
+
+        <div class="jira-toolbar">
+          <div class="jira-tabs" role="tablist">
+            <button type="button" class="jira-tab" data-view="board" role="tab">Sprint-Board</button>
+            <button type="button" class="jira-tab" data-view="backlog" role="tab">Backlog & Sprints</button>
+            <button type="button" class="jira-tab" data-view="mine" role="tab">Meine Aufgaben</button>
+          </div>
+          <div class="jira-filters">
+            <select id="jiraBoardSprint" aria-label="Sprint auswählen" hidden></select>
+            <input type="search" id="jiraSearch" placeholder="Aufgaben durchsuchen" aria-label="Aufgaben durchsuchen">
+          </div>
+        </div>
+        <div class="jira-filterbar" role="group" aria-label="Filter">
+          <span class="jira-filterbar-label">Filter</span>
+          <select id="jiraFilterAssignee" aria-label="Nach Person filtern"></select>
+          <select id="jiraFilterStatus" aria-label="Nach Status filtern"></select>
+          <select id="jiraFilterType" aria-label="Nach Typ filtern"></select>
+          <select id="jiraFilterPriority" aria-label="Nach Priorität filtern"></select>
+          <select id="jiraFilterLabel" aria-label="Nach Label filtern"></select>
+          <label class="jira-filter-check"><input type="checkbox" id="jiraShowSubtasks" ${jiraState.showSubtasks ? 'checked' : ''}> Subtasks</label>
+          <button type="button" class="btn jira-filter-reset" id="jiraFilterReset" hidden>✕ Filter zurücksetzen</button>
+          <span class="jira-filter-count" id="jiraFilterCount"></span>
+        </div>
+
+        <div id="jiraContent"><div class="jira-loading">Lade Daten aus Jira …</div></div>
+      </main>
+
+      <div id="jiraModal" class="modal-overlay" hidden>
+        <div class="modal jira-modal" role="dialog" aria-modal="true" id="jiraModalBody"></div>
+      </div>
+    `;
+
+    bindHeader();
+    document.getElementById('btnJiraRefresh').addEventListener('click', async (e) => {
+      e.currentTarget.disabled = true;
+      await jiraLoad({ refreshMeta: true, forceSync: true });
+      document.getElementById('btnJiraRefresh').disabled = false;
+      if (!jiraState.error) showToast('Mit Jira synchronisiert');
+    });
+    document.getElementById('btnJiraMapping').addEventListener('click', () => jiraOpenMapping());
+    document.getElementById('btnJiraNewIssue').addEventListener('click', () => jiraOpenIssueForm());
+    document.getElementById('btnJiraNewSprint').addEventListener('click', () => jiraOpenSprintForm());
+    document.querySelectorAll('.jira-tab').forEach(btn => btn.addEventListener('click', () => {
+      jiraState.view = btn.dataset.view;
+      localStorage.setItem('jiraView', jiraState.view);
+      jiraRenderChrome();
+      jiraRenderContent();
+    }));
+    document.getElementById('jiraBoardSprint').addEventListener('change', (e) => {
+      jiraState.boardSprintId = Number(e.target.value);
+      jiraRenderChrome();
+      jiraRenderContent();
+    });
+    document.getElementById('jiraFilterAssignee').addEventListener('change', (e) => {
+      jiraState.filterAssignee = e.target.value;
+      jiraUpdateFilterUi();
+      jiraRenderContent();
+    });
+    for (const [id, key] of [['jiraFilterStatus', 'status'], ['jiraFilterType', 'type'], ['jiraFilterPriority', 'priority'], ['jiraFilterLabel', 'label']]) {
+      document.getElementById(id).addEventListener('change', (e) => {
+        jiraState.filters[key] = e.target.value;
+        try { localStorage.setItem('jiraFilters', JSON.stringify(jiraState.filters)); } catch {}
+        jiraUpdateFilterUi();
+        jiraRenderContent();
+      });
+    }
+    document.getElementById('jiraFilterReset').addEventListener('click', () => {
+      jiraState.filters = { ...JIRA_FILTER_DEFAULTS };
+      jiraState.filterAssignee = 'all';
+      jiraState.search = '';
+      document.getElementById('jiraSearch').value = '';
+      try { localStorage.removeItem('jiraFilters'); } catch {}
+      jiraRenderChrome();
+      jiraRenderContent();
+    });
+    document.getElementById('jiraSearch').addEventListener('input', (e) => {
+      jiraState.search = e.target.value;
+      jiraUpdateFilterUi();
+      jiraRenderContent();
+    });
+    document.getElementById('jiraShowSubtasks').addEventListener('change', (e) => {
+      jiraState.showSubtasks = e.target.checked;
+      localStorage.setItem('jiraShowSubtasks', String(jiraState.showSubtasks));
+      jiraRenderContent();
+    });
+    const overlay = document.getElementById('jiraModal');
+    overlay.addEventListener('click', (e) => { if (e.target.id === 'jiraModal') closeDialog(overlay); });
+
+    jiraStartPolling();
+
+    // Treffer der globalen Suche direkt hier öffnen
+    onSearchNavigate((hit) => {
+      if (hit.type !== 'issue') return false;
+      jiraOpenDetail(hit.key);
+      return true;
+    });
+
+    // Direktlinks: ?issue=PROJ-45 öffnet die Aufgabe, ?new=1 das Anlegen-Fenster (z. B. vom Dashboard)
+    const params = new URLSearchParams(window.location.search);
+    const issueParam = params.get('issue');
+    const wantsNew = params.get('new') === '1';
+    if (params.toString()) history.replaceState(null, '', '/sprints');
+    jiraLoad().then(() => {
+      if (!jiraState.meta) return;
+      if (issueParam && /^[A-Z][A-Z0-9]+-\d+$/i.test(issueParam)) jiraOpenDetail(issueParam.toUpperCase());
+      else if (wantsNew) jiraOpenIssueForm();
+    });
+  }
+
+  function jiraStartPolling() {
+    if (jiraState.pollTimer) clearInterval(jiraState.pollTimer);
+    if (jiraState.statusTimer) clearInterval(jiraState.statusTimer);
+    jiraState.pollTimer = setInterval(() => {
+      if (!document.getElementById('jiraPage')) {
+        clearInterval(jiraState.pollTimer);
+        jiraState.pollTimer = null;
+        return;
+      }
+      if (!document.hidden && !jiraState.loading && !document.querySelector('.jira-card.is-dragging')) {
+        jiraLoad({ silent: true });
+      }
+    }, 20000);
+    jiraState.statusTimer = setInterval(jiraRenderSyncStatus, 5000);
+    // Beim Zurückkehren in den Tab sofort nachziehen
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && document.getElementById('jiraPage') && !jiraState.loading) jiraLoad({ silent: true });
+    });
+  }
+
+  // Holt nur die Änderungen seit dem letzten Stand (beim ersten Aufruf einmal alles) aus dem Server-Spiegel
+  async function jiraLoad({ silent = false, refreshMeta = false, forceSync = false } = {}) {
+    if (!document.getElementById('jiraPage')) return;
+    // Nur das Ergebnis der jüngsten Abfrage übernehmen
+    const seq = ++jiraState.loadSeq;
+    jiraState.loading = true;
+    if (!silent && !jiraState.loaded) {
+      document.getElementById('jiraContent').innerHTML = '<div class="jira-loading">Lade Daten aus Jira …</div>';
+    }
+    let changed = !jiraState.loaded;
+    try {
+      const meta = (!jiraState.meta || refreshMeta) ? await jiraApi('/meta' + (refreshMeta ? '?refresh=1' : '')) : jiraState.meta;
+      if (forceSync) await jiraApi('/sync', { method: 'POST' });
+      const changes = await jiraApi(`/changes?since=${jiraState.rev}`);
+      if (seq !== jiraState.loadSeq) return;
+      changed = changed || meta !== jiraState.meta || changes.complete || changes.issues.length > 0 || changes.deleted.length > 0 || Boolean(changes.sprints) || Boolean(jiraState.error);
+      jiraState.meta = meta;
+      jiraApplyChanges(changes);
+      jiraState.error = null;
+    } catch (e) {
+      if (e.message === 'unauthorized' || seq !== jiraState.loadSeq) return;
+      changed = changed || jiraState.error !== e.message;
+      jiraState.error = e.message;
+    } finally {
+      if (seq === jiraState.loadSeq) jiraState.loading = false;
+    }
+    jiraRenderSyncStatus();
+    if (!changed) return;
+    jiraRebuildViews();
+    jiraRenderChrome();
+    // Nicht neu zeichnen, während jemand gerade eine Auswahlliste im Inhalt bedient
+    const active = document.activeElement;
+    if (silent && active?.tagName === 'SELECT' && document.getElementById('jiraContent')?.contains(active)) {
+      active.addEventListener('blur', () => jiraRenderContent(), { once: true });
+      return;
+    }
+    jiraRenderContent();
+  }
+
+  function jiraRenderChrome() {
+    const meta = jiraState.meta;
+    const notice = document.getElementById('jiraNotice');
+    if (!notice) return;
+    let noticeHtml = '';
+    if (jiraState.error) {
+      noticeHtml = `<div class="jira-notice is-error">${escapeHtml(jiraState.error)}</div>`;
+    } else if (meta && !meta.me?.accountId) {
+      noticeHtml = `<div class="jira-notice">Dein Portal-Konto ist noch keinem Jira-Account zugeordnet. „Meine Aufgaben“ und der Filter „Nur ich“ funktionieren erst danach. ${meta.canManage ? 'Die Zuordnung stellst du oben unter <strong>Zuordnung</strong> ein.' : 'Bitte einen Admin, das unter „Zuordnung“ einzustellen.'}</div>`;
+    }
+    notice.innerHTML = noticeHtml;
+
+    document.querySelectorAll('.jira-tab').forEach(btn => btn.classList.toggle('is-active', btn.dataset.view === jiraState.view));
+    if (!meta) return;
+
+    const openLink = document.getElementById('btnJiraOpen');
+    openLink.href = `${meta.baseUrl}/jira/software/projects/${encodeURIComponent(meta.projectKey)}/boards/${meta.boardId}`;
+    openLink.hidden = false;
+    document.getElementById('btnJiraMapping').hidden = !meta.canManage;
+    document.getElementById('jiraEyebrow').textContent = `NEXT IT · ${meta.projectName} (${meta.projectKey})`.toUpperCase();
+
+    const assigneeSelect = document.getElementById('jiraFilterAssignee');
+    assigneeSelect.innerHTML = `
+      <option value="all">Alle Personen</option>
+      ${meta.me?.accountId ? '<option value="me">Nur ich</option>' : ''}
+      <option value="none">Nicht zugewiesen</option>
+      ${jiraUsers().map(u => `<option value="${jiraAttr(u.accountId)}">${escapeHtml(u.displayName)}</option>`).join('')}
+    `;
+    if (![...assigneeSelect.options].some(o => o.value === jiraState.filterAssignee)) jiraState.filterAssignee = 'all';
+    assigneeSelect.value = jiraState.filterAssignee;
+    jiraRenderFilterOptions();
+
+    const sprintSelect = document.getElementById('jiraBoardSprint');
+    const open = jiraOpenSprints();
+    sprintSelect.hidden = jiraState.view !== 'board' || open.length < 2;
+    sprintSelect.innerHTML = open.map(s => `<option value="${s.id}">${escapeHtml(s.name)}${s.state === 'future' ? ' (geplant)' : ''}</option>`).join('');
+    if (jiraState.boardSprintId) sprintSelect.value = String(jiraState.boardSprintId);
+
+    const title = document.getElementById('jiraHeadTitle');
+    const sub = document.getElementById('jiraHeadSub');
+    const progress = document.getElementById('jiraHeadProgress');
+    const sprint = jiraState.sprints.find(s => s.id === jiraState.boardSprintId);
+    if (sprint) {
+      title.textContent = sprint.name;
+      sub.textContent = sprint.goal || 'Kein Sprintziel hinterlegt.';
+      const issues = (jiraState.issuesBySprint[sprint.id] || []).filter(i => !i.type?.subtask);
+      const done = issues.filter(i => i.status?.category === 'done').length;
+      const points = issues.reduce((sum, i) => sum + (Number(i.storyPoints) || 0), 0);
+      const pointsDone = issues.filter(i => i.status?.category === 'done').reduce((sum, i) => sum + (Number(i.storyPoints) || 0), 0);
+      const pct = issues.length ? Math.round(done / issues.length * 100) : 0;
+      progress.hidden = false;
+      progress.innerHTML = `
+        <span class="jira-state s-${jiraAttr(sprint.state)}">${sprint.state === 'active' ? 'Aktiv' : 'Geplant'}</span>
+        <span>${escapeHtml(jiraSprintRange(sprint))}${sprint.state === 'active' ? ' · ' + escapeHtml(jiraDaysLeft(sprint)) : ''}</span>
+        <span class="jira-progress-bar" title="${pct} % erledigt"><span style="width:${pct}%"></span></span>
+        <span>${done}/${issues.length} Aufgaben erledigt${points ? ` · ${pointsDone}/${points} Story Points` : ''}</span>
+      `;
+    } else {
+      title.textContent = 'Sprints & Aufgaben';
+      sub.textContent = 'Kein aktiver Sprint. Lege unter „Backlog & Sprints“ einen Sprint an und starte ihn.';
+      progress.hidden = true;
+    }
+  }
+
+  function jiraRenderFilterOptions() {
+    const meta = jiraState.meta;
+    if (!meta) return;
+    const f = jiraState.filters;
+    const catOrder = { new: 0, indeterminate: 1, done: 2 };
+    const statuses = [...meta.statuses].sort((a, b) => (catOrder[a.category] ?? 1) - (catOrder[b.category] ?? 1) || a.name.localeCompare(b.name, 'de'));
+    const fill = (id, html, key) => {
+      const el = document.getElementById(id);
+      el.innerHTML = html;
+      if (![...el.options].some(o => o.value === f[key])) f[key] = 'all';
+      el.value = f[key];
+    };
+    fill('jiraFilterStatus', `
+      <option value="all">Alle Status</option>
+      <option value="open">Nur offene (nicht erledigt)</option>
+      <optgroup label="Kategorie">
+        <option value="cat:new">Noch nicht begonnen</option>
+        <option value="cat:indeterminate">In Arbeit</option>
+        <option value="cat:done">Erledigt</option>
+      </optgroup>
+      <optgroup label="Status">${statuses.map(st => `<option value="id:${jiraAttr(st.id)}">${escapeHtml(st.name)}</option>`).join('')}</optgroup>`, 'status');
+    fill('jiraFilterType', `<option value="all">Alle Typen</option>${meta.issueTypes.filter(t => t.name !== 'Epic').map(t => `<option value="${jiraAttr(t.name)}">${escapeHtml(t.name)}</option>`).join('')}`, 'type');
+    fill('jiraFilterPriority', `<option value="all">Alle Prioritäten</option>${meta.priorities.map(p => `<option value="${jiraAttr(p.id)}">${escapeHtml(jiraPrioLabel(p))}</option>`).join('')}`, 'priority');
+    const labels = [...new Set((jiraState.derived || []).flatMap(i => jiraVisibleLabels(i.labels)))].sort((a, b) => a.localeCompare(b, 'de'));
+    fill('jiraFilterLabel', `<option value="all">Alle Labels</option>${labels.map(l => `<option value="${jiraAttr(l)}">${escapeHtml(l)}</option>`).join('')}`, 'label');
+    jiraUpdateFilterUi();
+  }
+
+  function jiraFiltersActive() {
+    const f = jiraState.filters;
+    return jiraState.filterAssignee !== 'all' || jiraState.search.trim() !== '' || Object.keys(JIRA_FILTER_DEFAULTS).some(k => f[k] !== 'all');
+  }
+
+  function jiraUpdateFilterUi() {
+    const f = jiraState.filters;
+    const marks = [['jiraFilterAssignee', jiraState.filterAssignee], ['jiraFilterStatus', f.status], ['jiraFilterType', f.type], ['jiraFilterPriority', f.priority], ['jiraFilterLabel', f.label]];
+    for (const [id, value] of marks) document.getElementById(id)?.classList.toggle('is-active', value !== 'all');
+    const reset = document.getElementById('jiraFilterReset');
+    if (reset) reset.hidden = !jiraFiltersActive();
+  }
+
+  // Anzahl der sichtbaren Aufgaben in der aktuellen Ansicht
+  function jiraUpdateFilterCount() {
+    const el = document.getElementById('jiraFilterCount');
+    if (!el) return;
+    let pool = [];
+    if (jiraState.view === 'board') pool = jiraState.issuesBySprint[jiraState.boardSprintId] || [];
+    else if (jiraState.view === 'backlog') pool = [...Object.values(jiraState.issuesBySprint).flat(), ...jiraState.backlog];
+    else pool = jiraState.mine;
+    pool = pool.filter(i => i.type?.name !== 'Epic');
+    const visible = jiraFilter(pool).length;
+    el.textContent = jiraFiltersActive() ? `${visible} von ${pool.length} Aufgaben` : `${pool.length} Aufgaben`;
+  }
+
+  function jiraRenderContent() {
+    const content = document.getElementById('jiraContent');
+    if (!content) return;
+    if (!jiraState.meta) {
+      content.innerHTML = jiraState.error ? '' : '<div class="jira-loading">Lade Daten aus Jira …</div>';
+      return;
+    }
+    if (jiraState.view === 'board') jiraRenderBoard(content);
+    else if (jiraState.view === 'backlog') jiraRenderBacklog(content);
+    else jiraRenderMine(content);
+    jiraUpdateFilterCount();
+  }
+
+  /* ----- Board ----- */
+  function jiraCard(issue) {
+    const subInfo = issue.subtaskCount ? `<span title="Subtasks erledigt">☑ ${issue.subtasksDone}/${issue.subtaskCount}</span>` : '';
+    return `
+      <button type="button" class="jira-card" draggable="true" data-key="${jiraAttr(issue.key)}">
+        ${issue.displayParent ? `<div class="jira-card-parent">↳ ${escapeHtml(issue.displayParent.key)} ${escapeHtml(issue.displayParent.summary)}</div>` : ''}
+        <div class="jira-card-title">${escapeHtml(issue.summary)}</div>
+        <div class="jira-card-foot">
+          <div class="jira-card-meta">
+            ${jiraTypeBadge(issue.type)}
+            <span class="jira-key">${escapeHtml(issue.key)}</span>
+            ${jiraPrio(issue.priority)}
+            ${issue.storyPoints != null ? `<span class="jira-pts" title="Story Points">${escapeHtml(issue.storyPoints)}</span>` : ''}
+            ${subInfo}
+          </div>
+          ${jiraAvatar(issue.assignee)}
+        </div>
+      </button>`;
+  }
+
+  function jiraRenderBoard(content) {
+    const sprintId = jiraState.boardSprintId;
+    if (!sprintId) {
+      content.innerHTML = `<div class="jira-sprint"><div class="jira-empty">Es gibt noch keinen aktiven Sprint. Wechsle zu „Backlog & Sprints“, um einen Sprint anzulegen und zu starten.</div></div>`;
+      return;
+    }
+    const issues = jiraFilter((jiraState.issuesBySprint[sprintId] || []).filter(i => i.type?.name !== 'Epic'));
+    const columns = jiraState.meta.columns;
+    content.innerHTML = `<div class="jira-board">${columns.map((col, idx) => {
+      const colIssues = issues.filter(i => col.statusIds.includes(String(i.status?.id)));
+      return `
+        <section class="jira-col" data-col="${idx}">
+          <div class="jira-col-head">${escapeHtml(col.name)} <span>${colIssues.length}</span></div>
+          <div class="jira-col-body">${colIssues.map(jiraCard).join('') || ''}</div>
+        </section>`;
+    }).join('')}</div>`;
+
+    content.querySelectorAll('.jira-card').forEach(card => {
+      card.addEventListener('click', () => jiraOpenDetail(card.dataset.key));
+      card.addEventListener('dragstart', (e) => {
+        card.classList.add('is-dragging');
+        e.dataTransfer.setData('text/plain', card.dataset.key);
+        e.dataTransfer.effectAllowed = 'move';
+      });
+      card.addEventListener('dragend', () => card.classList.remove('is-dragging'));
+    });
+    content.querySelectorAll('.jira-col').forEach(col => {
+      col.addEventListener('dragover', (e) => { e.preventDefault(); col.classList.add('is-over'); });
+      col.addEventListener('dragleave', (e) => { if (!col.contains(e.relatedTarget)) col.classList.remove('is-over'); });
+      col.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        col.classList.remove('is-over');
+        const key = e.dataTransfer.getData('text/plain');
+        const column = columns[Number(col.dataset.col)];
+        const issue = (jiraState.issuesBySprint[sprintId] || []).find(i => i.key === key);
+        if (!issue || !column || column.statusIds.includes(String(issue.status?.id))) return;
+        const targetStatus = jiraState.meta.statuses.find(s => s.id === column.statusIds[0]);
+        const previous = issue.status;
+        issue.status = targetStatus ? { ...targetStatus } : issue.status;
+        jiraRenderContent();
+        try {
+          await jiraApi(`/issues/${encodeURIComponent(key)}/transition`, { method: 'POST', body: { statusId: column.statusIds[0] } });
+          showToast(`${key} → ${column.name}`);
+          jiraLoad({ silent: true });
+        } catch (err) {
+          issue.status = previous;
+          jiraRenderContent();
+          showToast(err.message, true);
+        }
+      });
+    });
+  }
+
+  /* ----- Backlog & Sprints ----- */
+  function jiraMoveOptions(issue) {
+    const current = issue.sprint?.id ?? 'backlog';
+    const opts = [`<option value="">Verschieben …</option>`];
+    if (current !== 'backlog') opts.push('<option value="backlog">→ Backlog</option>');
+    for (const s of jiraOpenSprints()) {
+      if (s.id !== current) opts.push(`<option value="${s.id}">→ ${escapeHtml(s.name)}</option>`);
+    }
+    return opts.join('');
+  }
+
+  function jiraRow(issue, { depth = 0 } = {}) {
+    return `
+      <li class="jira-row ${depth ? 'is-sub' : ''}" style="--depth:${depth}" data-key="${jiraAttr(issue.key)}">
+        <button type="button" class="jira-row-main" data-open="${jiraAttr(issue.key)}">
+          ${jiraTypeBadge(issue.type)}
+          <span class="jira-key">${escapeHtml(issue.key)}</span>
+          ${jiraPrio(issue.priority)}
+          <span class="jira-row-title">${escapeHtml(issue.summary)}</span>
+        </button>
+        ${issue.storyPoints != null ? `<span class="jira-pts" title="Story Points">${escapeHtml(issue.storyPoints)}</span>` : '<span></span>'}
+        ${jiraStatusPill(issue.status)}
+        <select class="jira-inline-select jira-row-assign" data-assign="${jiraAttr(issue.key)}" aria-label="Zuständig">${jiraUserOptions(issue.assignee?.accountId)}</select>
+        ${depth || issue.type?.subtask ? '<span class="jira-row-move"></span>' : `<select class="jira-inline-select jira-row-move" data-move="${jiraAttr(issue.key)}" aria-label="Verschieben">${jiraMoveOptions(issue)}</select>`}
+      </li>`;
+  }
+
+  function jiraRowsHtml(issues) {
+    const filtered = jiraFilter(issues);
+    if (!filtered.length) return '<div class="jira-empty">Keine Aufgaben.</div>';
+    // Beliebig tief verschachteln; ist der Elternteil herausgefiltert, steht das Kind oben
+    const keys = new Set(filtered.map(i => i.key));
+    const kids = new Map();
+    for (const issue of filtered) {
+      const p = issue.logicalParentKey;
+      if (!p || !keys.has(p)) continue;
+      if (!kids.has(p)) kids.set(p, []);
+      kids.get(p).push(issue);
+    }
+    const html = [];
+    const seen = new Set();
+    const walk = (issue, depth) => {
+      if (seen.has(issue.key)) return;
+      seen.add(issue.key);
+      html.push(jiraRow(issue, { depth }));
+      for (const child of kids.get(issue.key) || []) walk(child, depth + 1);
+    };
+    filtered.filter(i => !(i.logicalParentKey && keys.has(i.logicalParentKey))).forEach(i => walk(i, 0));
+    filtered.forEach(i => walk(i, 0));
+    return `<ul class="jira-rows">${html.join('')}</ul>`;
+  }
+
+  function jiraSprintSection(sprint) {
+    const issues = jiraState.issuesBySprint[sprint.id] || [];
+    const parents = issues.filter(i => !i.type?.subtask);
+    const points = parents.reduce((sum, i) => sum + (Number(i.storyPoints) || 0), 0);
+    const actions = sprint.state === 'active'
+      ? `<button type="button" class="btn" data-sprint-edit="${sprint.id}">Bearbeiten</button>
+         <button type="button" class="btn btn-primary" data-sprint-close="${sprint.id}">Abschließen</button>`
+      : `<button type="button" class="btn" data-sprint-edit="${sprint.id}">Bearbeiten</button>
+         <button type="button" class="btn btn-danger" data-sprint-delete="${sprint.id}">Löschen</button>
+         <button type="button" class="btn btn-primary" data-sprint-start="${sprint.id}">Starten</button>`;
+    return `
+      <section class="jira-sprint">
+        <div class="jira-sprint-head">
+          <div class="jira-sprint-title">
+            <strong>${escapeHtml(sprint.name)}</strong>
+            <span class="jira-state s-${jiraAttr(sprint.state)}">${sprint.state === 'active' ? 'Aktiv' : 'Geplant'}</span>
+            <span class="jira-sprint-sub">${escapeHtml(jiraSprintRange(sprint))} · ${parents.length} Aufgaben${points ? ` · ${points} SP` : ''}</span>
+          </div>
+          <div class="jira-sprint-actions">
+            <button type="button" class="btn" data-sprint-add="${sprint.id}">+ Aufgabe</button>
+            ${actions}
+          </div>
+        </div>
+        ${sprint.goal ? `<div class="jira-sprint-goal">Ziel: ${escapeHtml(sprint.goal)}</div>` : ''}
+        ${jiraRowsHtml(issues)}
+      </section>`;
+  }
+
+  function jiraRenderBacklog(content) {
+    const open = jiraOpenSprints();
+    content.innerHTML = `
+      ${open.map(jiraSprintSection).join('')}
+      <section class="jira-sprint">
+        <div class="jira-sprint-head">
+          <div class="jira-sprint-title">
+            <strong>Backlog</strong>
+            <span class="jira-sprint-sub">${jiraState.backlog.filter(i => !i.type?.subtask).length} Aufgaben ohne Sprint</span>
+          </div>
+          <div class="jira-sprint-actions">
+            <button type="button" class="btn" data-sprint-add="">+ Aufgabe</button>
+            <button type="button" class="btn" data-sprint-new="1">+ Sprint erstellen</button>
+          </div>
+        </div>
+        ${jiraRowsHtml(jiraState.backlog)}
+      </section>`;
+    jiraBindRows(content);
+
+    content.querySelectorAll('[data-sprint-add]').forEach(b => b.addEventListener('click', () => jiraOpenIssueForm({ defaults: { sprintId: b.dataset.sprintAdd ? Number(b.dataset.sprintAdd) : '' } })));
+    content.querySelectorAll('[data-sprint-new]').forEach(b => b.addEventListener('click', () => jiraOpenSprintForm()));
+    content.querySelectorAll('[data-sprint-edit]').forEach(b => b.addEventListener('click', () => jiraOpenSprintForm(jiraState.sprints.find(s => s.id === Number(b.dataset.sprintEdit)))));
+    content.querySelectorAll('[data-sprint-start]').forEach(b => b.addEventListener('click', () => jiraOpenSprintForm(jiraState.sprints.find(s => s.id === Number(b.dataset.sprintStart)), { start: true })));
+    content.querySelectorAll('[data-sprint-close]').forEach(b => b.addEventListener('click', () => jiraOpenCloseSprint(jiraState.sprints.find(s => s.id === Number(b.dataset.sprintClose)))));
+    content.querySelectorAll('[data-sprint-delete]').forEach(b => b.addEventListener('click', () => jiraDeleteSprint(jiraState.sprints.find(s => s.id === Number(b.dataset.sprintDelete)))));
+  }
+
+  function jiraBindRows(content) {
+    content.querySelectorAll('[data-open]').forEach(b => b.addEventListener('click', () => jiraOpenDetail(b.dataset.open)));
+    content.querySelectorAll('[data-assign]').forEach(sel => sel.addEventListener('change', async () => {
+      try {
+        await jiraApi(`/issues/${encodeURIComponent(sel.dataset.assign)}/assignee`, { method: 'PUT', body: { accountId: sel.value || null } });
+        const name = jiraUsers().find(u => u.accountId === sel.value)?.displayName;
+        showToast(name ? `${sel.dataset.assign} → ${name}` : `${sel.dataset.assign}: Zuweisung entfernt`);
+        jiraLoad({ silent: true });
+      } catch (e) { showToast(e.message, true); jiraLoad({ silent: true }); }
+    }));
+    content.querySelectorAll('[data-move]').forEach(sel => sel.addEventListener('change', async () => {
+      if (!sel.value) return;
+      try {
+        await jiraApi(`/issues/${encodeURIComponent(sel.dataset.move)}/move`, { method: 'POST', body: { target: sel.value === 'backlog' ? 'backlog' : Number(sel.value) } });
+        showToast(`${sel.dataset.move} verschoben`);
+        jiraLoad({ silent: true });
+      } catch (e) { showToast(e.message, true); sel.value = ''; }
+    }));
+  }
+
+  /* ----- Meine Aufgaben ----- */
+  function jiraRenderMine(content) {
+    if (!jiraState.meta.me?.accountId) {
+      content.innerHTML = '<div class="jira-sprint"><div class="jira-empty">Dein Konto ist noch keinem Jira-Account zugeordnet.</div></div>';
+      return;
+    }
+    const issues = jiraFilter(jiraState.mine);
+    const groups = new Map();
+    for (const issue of issues) {
+      const label = issue.sprint ? issue.sprint.name : 'Backlog';
+      if (!groups.has(label)) groups.set(label, []);
+      groups.get(label).push(issue);
+    }
+    if (!issues.length) {
+      content.innerHTML = '<div class="jira-sprint"><div class="jira-empty">Dir sind gerade keine offenen Aufgaben zugewiesen. 🎉</div></div>';
+      return;
+    }
+    content.innerHTML = [...groups.entries()].map(([label, list]) => `
+      <section class="jira-sprint">
+        <div class="jira-sprint-head"><div class="jira-sprint-title"><strong>${escapeHtml(label)}</strong><span class="jira-sprint-sub">${list.length} offen</span></div></div>
+        <ul class="jira-rows">${list.map(i => jiraRow(i)).join('')}</ul>
+      </section>`).join('');
+    jiraBindRows(content);
+  }
+
+  /* ----- Modal-Helfer ----- */
+  function jiraShowModal(html, { wide = false } = {}) {
+    const overlay = document.getElementById('jiraModal');
+    const body = document.getElementById('jiraModalBody');
+    body.className = 'modal jira-modal' + (wide ? ' is-wide' : '');
+    body.innerHTML = html;
+    if (!overlay.hidden) {
+      overlay.removeEventListener('keydown', overlay._onKey);
+      openDialog(overlay, { keepFocus: true });
+    } else {
+      openDialog(overlay);
+    }
+    body.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => closeDialog(overlay)));
+    return body;
+  }
+
+  function jiraCloseModal() {
+    const overlay = document.getElementById('jiraModal');
+    if (overlay && !overlay.hidden) closeDialog(overlay);
+  }
+
+  /* ----- Aufgabe anlegen / bearbeiten ----- */
+  async function jiraOpenIssueForm({ issue = null, defaults = {} } = {}) {
+    const meta = jiraState.meta;
+    if (!meta) return;
+    const epics = jiraState.epics;
+    const parents = jiraState.openParents;
+
+    const types = meta.issueTypes;
+    const defaultType = issue?.type?.id || defaults.typeId || types.find(t => t.name === 'Task')?.id || types.find(t => !t.subtask)?.id;
+    const defaultPriority = issue?.priority?.id || meta.priorities.find(p => p.name === 'Medium')?.id || '';
+    const sprintId = defaults.sprintId ?? (jiraState.view === 'board' ? jiraState.boardSprintId : '');
+    const partOf = defaults.partOf || (issue ? jiraPartOf(issue) : null);
+    const partOfIssue = partOf ? jiraFindIssue(partOf) : null;
+
+    const body = jiraShowModal(`
+      <h2>${issue ? `${escapeHtml(issue.key)} bearbeiten` : 'Neue Aufgabe'}</h2>
+      <form id="jiraIssueForm" novalidate>
+        <div class="field-row">
+          <div class="field">
+            <label for="jiType">Typ</label>
+            <select id="jiType" ${issue || partOf ? 'disabled' : ''}>${types.map(t => `<option value="${jiraAttr(t.id)}" ${t.id === defaultType ? 'selected' : ''}>${escapeHtml(t.name)}</option>`).join('')}</select>
+          </div>
+          <div class="field">
+            <label for="jiPriority">Priorität</label>
+            <select id="jiPriority">${meta.priorities.map(p => `<option value="${jiraAttr(p.id)}" ${p.id === defaultPriority ? 'selected' : ''}>${escapeHtml(jiraPrioLabel(p))}</option>`).join('')}</select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="jiSummary">Titel*</label>
+          <input type="text" id="jiSummary" maxlength="255" required value="${jiraAttr(issue?.summary || '')}">
+        </div>
+        <div class="field">
+          <label for="jiDescription">Beschreibung</label>
+          <textarea id="jiDescription" rows="5">${escapeHtml(issue?.description || '')}</textarea>
+          ${issue ? '<p class="modal-note" style="margin-top:6px">Wird die Beschreibung hier geändert, gehen Formatierungen aus Jira (Listen, Fett …) verloren.</p>' : ''}
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="jiAssignee">Zuständig</label>
+            <select id="jiAssignee">${jiraUserOptions(issue ? issue.assignee?.accountId : (defaults.assigneeId || ''))}</select>
+          </div>
+          <div class="field">
+            <label for="jiPoints">Story Points</label>
+            <input type="number" id="jiPoints" min="0" step="0.5" value="${jiraAttr(issue?.storyPoints ?? '')}">
+          </div>
+        </div>
+        ${partOf ? `<div class="field jira-partof">
+          <label>Gehört zu</label>
+          <div><strong>${escapeHtml(partOf)}</strong> · ${escapeHtml(partOfIssue?.summary || '')}</div>
+          <p class="modal-note" style="margin:6px 0 0">Jira erlaubt nur eine Subtask-Ebene. Diese Unteraufgabe ist in Jira ein Subtask von ${escapeHtml(defaults.parentKey || issue?.parent?.key || '')} mit dem Label <code>${JIRA_PART_PREFIX}${escapeHtml(partOf)}</code> und wird im Portal darunter angezeigt.</p>
+        </div>` : ''}
+        <div class="field" id="jiParentField">
+          <label for="jiParent" id="jiParentLabel">Epic</label>
+          <select id="jiParent"></select>
+        </div>
+        <div class="field-row">
+          <div class="field" id="jiSprintField" ${issue ? 'hidden' : ''}>
+            <label for="jiSprint">Sprint</label>
+            <select id="jiSprint">
+              <option value="">Backlog</option>
+              ${jiraOpenSprints().map(s => `<option value="${s.id}" ${s.id === Number(sprintId) ? 'selected' : ''}>${escapeHtml(s.name)}</option>`).join('')}
+            </select>
+          </div>
+          <div class="field">
+            <label for="jiDue">Fällig am</label>
+            <input type="date" id="jiDue" value="${jiraAttr(issue?.duedate || '')}">
+          </div>
+        </div>
+        <div class="field">
+          <label for="jiLabels">Labels (mit Komma getrennt)</label>
+          <input type="text" id="jiLabels" value="${jiraAttr(jiraVisibleLabels(issue?.labels).join(', '))}">
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn" data-close>Abbrechen</button>
+          <button type="submit" class="btn btn-primary" id="jiSubmit">${issue ? 'Speichern' : 'Anlegen'}</button>
+        </div>
+      </form>
+    `);
+
+    const typeSelect = body.querySelector('#jiType');
+    const parentSelect = body.querySelector('#jiParent');
+    const currentParent = issue?.parent?.key || defaults.parentKey || '';
+    function syncParentField() {
+      const type = types.find(t => t.id === typeSelect.value);
+      const field = body.querySelector('#jiParentField');
+      const label = body.querySelector('#jiParentLabel');
+      body.querySelector('#jiSprintField').hidden = Boolean(issue) || Boolean(type?.subtask);
+      if (partOf) { field.hidden = true; parentSelect.innerHTML = ''; return; }
+      if (type?.name === 'Epic' || (type?.hierarchyLevel ?? 0) > 0) { field.hidden = true; parentSelect.innerHTML = ''; return; }
+      field.hidden = false;
+      if (type?.subtask) {
+        label.textContent = 'Übergeordnete Aufgabe*';
+        const list = parents.some(p => p.key === currentParent) || !currentParent ? parents : [{ key: currentParent, summary: issue?.parent?.summary || '' }, ...parents];
+        parentSelect.innerHTML = '<option value="">Bitte wählen …</option>' + list.map(p => `<option value="${jiraAttr(p.key)}" ${p.key === currentParent ? 'selected' : ''}>${escapeHtml(p.key)} · ${escapeHtml(p.summary)}</option>`).join('');
+      } else {
+        label.textContent = 'Epic';
+        parentSelect.innerHTML = '<option value="">Kein Epic</option>' + epics.map(p => `<option value="${jiraAttr(p.key)}" ${p.key === currentParent ? 'selected' : ''}>${escapeHtml(p.key)} · ${escapeHtml(p.summary)}</option>`).join('');
+      }
+    }
+    typeSelect.addEventListener('change', syncParentField);
+    syncParentField();
+    body.querySelector('#jiSummary').focus();
+
+    body.querySelector('#jiraIssueForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const type = types.find(t => t.id === typeSelect.value);
+      const payload = {
+        summary: body.querySelector('#jiSummary').value.trim(),
+        description: body.querySelector('#jiDescription').value,
+        assigneeId: body.querySelector('#jiAssignee').value || null,
+        priorityId: body.querySelector('#jiPriority').value,
+        storyPoints: body.querySelector('#jiPoints').value,
+        duedate: body.querySelector('#jiDue').value || null,
+        labels: jiraNormalizeLabels([...body.querySelector('#jiLabels').value.split(','), partOf ? `${JIRA_PART_PREFIX}${partOf}` : '']),
+      };
+      if (!body.querySelector('#jiParentField').hidden) payload.parentKey = parentSelect.value || null;
+      else if (partOf && !issue) payload.parentKey = defaults.parentKey || null;
+      if (!payload.summary) { showToast('Bitte einen Titel eingeben', true); return; }
+      if (!issue && type?.subtask && !payload.parentKey) { showToast('Bitte die übergeordnete Aufgabe wählen', true); return; }
+      const submit = body.querySelector('#jiSubmit');
+      submit.disabled = true;
+      try {
+        if (issue) {
+          // Nur geänderte Felder schicken – nicht jedes Feld liegt bei jedem Typ auf der Jira-Maske
+          const original = {
+            summary: issue.summary,
+            description: issue.description || '',
+            priorityId: issue.priority?.id || '',
+            storyPoints: issue.storyPoints == null ? '' : String(issue.storyPoints),
+            duedate: issue.duedate || null,
+            labels: jiraNormalizeLabels(issue.labels),
+            parentKey: issue.parent?.key || null,
+          };
+          const changes = {};
+          for (const [k, v] of Object.entries(payload)) {
+            if (k !== 'assigneeId' && k in original && String(v ?? '') !== String(original[k] ?? '')) changes[k] = v;
+          }
+          if (Object.keys(changes).length) {
+            await jiraApi(`/issues/${encodeURIComponent(issue.key)}`, { method: 'PUT', body: changes });
+          }
+          if ((payload.assigneeId || null) !== (issue.assignee?.accountId || null)) {
+            await jiraApi(`/issues/${encodeURIComponent(issue.key)}/assignee`, { method: 'PUT', body: { accountId: payload.assigneeId } });
+          }
+          showToast(`${issue.key} gespeichert`);
+          jiraOpenDetail(issue.key);
+        } else {
+          const created = await jiraApi('/issues', { method: 'POST', body: { ...payload, typeId: type.id, sprintId: body.querySelector('#jiSprint').value || null } });
+          showToast(`${created.key} angelegt`);
+          jiraCloseModal();
+        }
+        jiraLoad({ silent: true });
+      } catch (err) {
+        showToast(err.message, true);
+        submit.disabled = false;
+      }
+    });
+  }
+
+  /* ----- Aufgabe Detail ----- */
+  async function jiraOpenDetail(key) {
+    let issue, mentions = [];
+    try {
+      const [detail, mentionRes] = await Promise.all([
+        jiraApi(`/issues/${encodeURIComponent(key)}`),
+        hasModule('docs') ? fetchJson(`/api/docs/mentions/${encodeURIComponent(key)}`).catch(() => null) : null,
+      ]);
+      issue = detail;
+      mentions = mentionRes?.res.ok && Array.isArray(mentionRes.data) ? mentionRes.data : [];
+    } catch (e) { showToast(e.message, true); return; }
+    const meta = jiraState.meta;
+    const statusOptions = [`<option value="" selected>${escapeHtml(issue.status?.name || '—')}</option>`]
+      .concat(issue.transitions.filter(t => String(t.toId) !== String(issue.status?.id)).map(t => `<option value="${jiraAttr(t.toId)}">→ ${escapeHtml(t.toName || t.name)}</option>`))
+      .join('');
+    const subtaskType = meta.issueTypes.find(t => t.subtask);
+    const local = jiraFindIssue(issue.key);
+    const upKey = local?.logicalParentKey || issue.parent?.key || null;
+    const upSummary = (upKey && jiraFindIssue(upKey)?.summary) || issue.parent?.summary || '';
+    const children = (jiraState.derived || []).filter(i => i.logicalParentKey === issue.key);
+    const canHaveChildren = Boolean(subtaskType) && issue.type?.name !== 'Epic';
+
+    const body = jiraShowModal(`
+      <div class="jira-detail-head">
+        <div>
+          <div class="jira-card-meta">${jiraTypeBadge(issue.type)} <a href="${jiraAttr(issue.url)}" target="_blank" rel="noopener" class="jira-key">${escapeHtml(issue.key)} ↗</a>
+            ${upKey ? `· <button type="button" class="btn-link jira-key" data-open-key="${jiraAttr(upKey)}" style="border:0;background:none;cursor:pointer;color:var(--accent);padding:0">↑ ${escapeHtml(upKey)} ${escapeHtml(upSummary)}</button>` : ''}
+          </div>
+          <h2 class="jira-title-edit" id="jdTitle" tabindex="0" role="button" title="Klicken zum Bearbeiten">${escapeHtml(issue.summary)} <span class="jira-edit-hint" aria-hidden="true">✎</span></h2>
+        </div>
+        <button type="button" class="btn btn-icon" data-close aria-label="Schließen">✕</button>
+      </div>
+      <div class="jira-detail-grid">
+        <div>
+          <div class="jira-section-title jira-section-row">Beschreibung <button type="button" class="btn jira-mini-btn" id="jdEditDesc">✎ Bearbeiten</button></div>
+          <div id="jdDescBox"><div class="jira-description jira-description-editable ${issue.description ? '' : 'is-empty'}" id="jdDesc" title="Klicken zum Bearbeiten">${issue.description ? escapeHtml(issue.description) : 'Keine Beschreibung – klicken, um eine hinzuzufügen.'}</div></div>
+
+          <div class="jira-section-title">Erwähnt in Dokumenten (${mentions.length})</div>
+          ${mentions.length ? `<div class="jira-mentions">${mentions.map(d => `
+            <a class="jira-mention" href="/dokumentation?doc=${d.id}">📄 <span>${escapeHtml(d.title)}</span><small>${escapeHtml(d.folder_name || 'Dokumentation')}</small></a>`).join('')}</div>`
+          : `<div class="jira-empty" style="padding:4px 0">Noch in keinem Dokument erwähnt. Schreibe <code>${escapeHtml(issue.key)}</code> in ein Dokument, um es zu verknüpfen.</div>`}
+
+          ${canHaveChildren ? `
+            <div class="jira-section-title">Unteraufgaben ${children.length ? `(${children.filter(s => s.status?.category === 'done').length}/${children.length})` : ''}</div>
+            ${children.map(s => `<button type="button" class="jira-subtask" data-open-key="${jiraAttr(s.key)}">${jiraTypeBadge(s.type)}<span class="jira-key">${escapeHtml(s.key)}</span><span class="jira-row-title">${escapeHtml(s.summary)}</span>${s.subtaskCount ? `<span class="jira-key">☑ ${s.subtasksDone}/${s.subtaskCount}</span>` : ''}${jiraStatusPill(s.status)}${jiraAvatar(s.assignee, 20)}</button>`).join('')}
+            <button type="button" class="btn" id="jdAddSub">+ Unteraufgabe</button>` : ''}
+
+          <div class="jira-section-title">Kommentare (${issue.comments.length})</div>
+          <form class="jira-inline-form" id="jdCommentForm" style="margin-bottom:10px">
+            <input type="text" id="jdComment" placeholder="Kommentar schreiben …" aria-label="Kommentar">
+            <button type="submit" class="btn btn-primary">Senden</button>
+          </form>
+          ${issue.comments.map(c => `
+            <div class="jira-comment">
+              <div class="jira-comment-meta">${jiraAvatar(c.author, 20)} <strong>${escapeHtml(c.author?.displayName || 'Unbekannt')}</strong> · ${escapeHtml(jiraDate(c.created, true))}</div>
+              <div class="jira-comment-body">${escapeHtml(c.body)}</div>
+            </div>`).join('') || '<div class="jira-empty" style="padding:4px 0">Noch keine Kommentare.</div>'}
+        </div>
+        <aside class="jira-side">
+          <div><label for="jdStatus">Status</label><select class="jira-inline-select" id="jdStatus">${statusOptions}</select></div>
+          <div><label for="jdAssignee">Zuständig</label><select class="jira-inline-select" id="jdAssignee">${jiraUserOptions(issue.assignee?.accountId)}</select></div>
+          ${!issue.type?.subtask ? `<div><label for="jdSprint">Sprint</label><select class="jira-inline-select" id="jdSprint">
+            <option value="backlog" ${!issue.sprint ? 'selected' : ''}>Backlog</option>
+            ${jiraOpenSprints().map(s => `<option value="${s.id}" ${issue.sprint?.id === s.id ? 'selected' : ''}>${escapeHtml(s.name)}</option>`).join('')}
+          </select></div>` : ''}
+          <div><label>Priorität</label>${escapeHtml(jiraPrioLabel(issue.priority) || '—')}</div>
+          <div><label>Story Points</label>${escapeHtml(issue.storyPoints ?? '—')}</div>
+          <div><label>Fällig am</label>${escapeHtml(issue.duedate ? jiraDate(issue.duedate) : '—')}</div>
+          <div><label>Labels</label>${issue.labels.length ? issue.labels.map(l => `<span class="jira-status">${escapeHtml(l)}</span>`).join(' ') : '—'}</div>
+          <div><label>Gemeldet von</label>${escapeHtml(issue.reporter?.displayName || '—')}</div>
+          <div><label>Gebuchte Zeit</label>${escapeHtml(issue.timeSpent || '—')}
+            <form class="jira-inline-form" id="jdWorklogForm"><input type="text" id="jdWorklog" placeholder="z. B. 1h 30m" aria-label="Zeit buchen"><button type="submit" class="btn">Buchen</button></form>
+          </div>
+          <div><label>Erstellt / geändert</label>${escapeHtml(jiraDate(issue.created))} · ${escapeHtml(jiraDate(issue.updated))}</div>
+          <div class="modal-actions" style="flex-wrap:wrap">
+            <button type="button" class="btn" id="jdEdit">Bearbeiten</button>
+            ${meta.canManage ? '<button type="button" class="btn btn-danger" id="jdDelete">Löschen</button>' : ''}
+          </div>
+        </aside>
+      </div>
+    `, { wide: true });
+
+    const reload = () => { jiraOpenDetail(key); jiraLoad({ silent: true }); };
+
+    body.querySelectorAll('[data-open-key]').forEach(b => b.addEventListener('click', () => jiraOpenDetail(b.dataset.openKey)));
+    body.querySelector('#jdStatus').addEventListener('change', async (e) => {
+      if (!e.target.value) return;
+      try {
+        await jiraApi(`/issues/${encodeURIComponent(key)}/transition`, { method: 'POST', body: { statusId: e.target.value } });
+        showToast('Status geändert');
+        reload();
+      } catch (err) { showToast(err.message, true); e.target.value = ''; }
+    });
+    body.querySelector('#jdAssignee').addEventListener('change', async (e) => {
+      try {
+        await jiraApi(`/issues/${encodeURIComponent(key)}/assignee`, { method: 'PUT', body: { accountId: e.target.value || null } });
+        showToast('Zuweisung gespeichert');
+        reload();
+      } catch (err) { showToast(err.message, true); }
+    });
+    body.querySelector('#jdSprint')?.addEventListener('change', async (e) => {
+      try {
+        await jiraApi(`/issues/${encodeURIComponent(key)}/move`, { method: 'POST', body: { target: e.target.value === 'backlog' ? 'backlog' : Number(e.target.value) } });
+        showToast('Verschoben');
+        reload();
+      } catch (err) { showToast(err.message, true); }
+    });
+    body.querySelector('#jdCommentForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const text = body.querySelector('#jdComment').value.trim();
+      if (!text) return;
+      try {
+        await jiraApi(`/issues/${encodeURIComponent(key)}/comments`, { method: 'POST', body: { text } });
+        showToast('Kommentar gespeichert');
+        jiraOpenDetail(key);
+      } catch (err) { showToast(err.message, true); }
+    });
+    body.querySelector('#jdWorklogForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const timeSpent = body.querySelector('#jdWorklog').value.trim();
+      if (!timeSpent) return;
+      try {
+        await jiraApi(`/issues/${encodeURIComponent(key)}/worklog`, { method: 'POST', body: { timeSpent } });
+        showToast(`${timeSpent} gebucht`);
+        jiraOpenDetail(key);
+      } catch (err) { showToast(err.message, true); }
+    });
+    body.querySelector('#jdEdit').addEventListener('click', () => jiraOpenIssueForm({ issue }));
+    body.querySelector('#jdAddSub')?.addEventListener('click', () => jiraOpenIssueForm({
+      defaults: issue.type?.subtask
+        // Unteraufgabe einer Unteraufgabe: in Jira Subtask der Hauptaufgabe + Label "teil-von-…"
+        ? { typeId: subtaskType.id, parentKey: issue.parent?.key, partOf: issue.key, assigneeId: issue.assignee?.accountId || '' }
+        : { typeId: subtaskType.id, parentKey: issue.key, assigneeId: issue.assignee?.accountId || '' },
+    }));
+
+    // Titel direkt bearbeiten
+    const saveField = async (fields, okText) => {
+      try {
+        await jiraApi(`/issues/${encodeURIComponent(key)}`, { method: 'PUT', body: fields });
+        showToast(okText);
+        reload();
+      } catch (err) { showToast(err.message, true); }
+    };
+    const titleEl = body.querySelector('#jdTitle');
+    const startTitleEdit = () => {
+      if (titleEl.querySelector('input')) return;
+      titleEl.innerHTML = `<input type="text" class="jira-title-input" maxlength="255" value="${jiraAttr(issue.summary)}" aria-label="Titel">`;
+      const input = titleEl.querySelector('input');
+      input.focus();
+      input.select();
+      let done = false;
+      const finish = (save) => {
+        if (done) return;
+        done = true;
+        const value = input.value.trim();
+        if (save && value && value !== issue.summary) saveField({ summary: value }, 'Titel gespeichert');
+        else titleEl.innerHTML = `${escapeHtml(issue.summary)} <span class="jira-edit-hint" aria-hidden="true">✎</span>`;
+      };
+      input.addEventListener('keydown', (e) => {
+        e.stopPropagation();
+        if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+        if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+      });
+      input.addEventListener('blur', () => finish(true));
+    };
+    titleEl.addEventListener('click', startTitleEdit);
+    titleEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target === titleEl) { e.preventDefault(); startTitleEdit(); } });
+
+    // Beschreibung direkt bearbeiten
+    const startDescEdit = () => {
+      const box = body.querySelector('#jdDescBox');
+      if (box.querySelector('textarea')) return;
+      box.innerHTML = `
+        <textarea class="jira-desc-input" rows="8" aria-label="Beschreibung">${escapeHtml(issue.description || '')}</textarea>
+        <p class="modal-note" style="margin:6px 0 8px">Formatierungen aus Jira (Listen, Fett …) gehen beim Speichern verloren.</p>
+        <div class="jira-inline-actions">
+          <button type="button" class="btn" id="jdDescCancel">Abbrechen</button>
+          <button type="button" class="btn btn-primary" id="jdDescSave">Speichern</button>
+        </div>`;
+      const area = box.querySelector('textarea');
+      area.focus();
+      area.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); jiraOpenDetail(key); }
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); box.querySelector('#jdDescSave').click(); }
+      });
+      box.querySelector('#jdDescCancel').addEventListener('click', () => jiraOpenDetail(key));
+      box.querySelector('#jdDescSave').addEventListener('click', (e) => {
+        e.currentTarget.disabled = true;
+        if (area.value === (issue.description || '')) { jiraOpenDetail(key); return; }
+        saveField({ description: area.value }, 'Beschreibung gespeichert');
+      });
+    };
+    body.querySelector('#jdEditDesc').addEventListener('click', startDescEdit);
+    body.querySelector('#jdDesc').addEventListener('click', startDescEdit);
+    body.querySelector('#jdDelete')?.addEventListener('click', async () => {
+      if (!confirm(`${key} „${issue.summary}“ wirklich in Jira löschen?${issue.subtasks.length ? ` Die ${issue.subtasks.length} Subtasks werden mitgelöscht.` : ''}`)) return;
+      try {
+        await jiraApi(`/issues/${encodeURIComponent(key)}`, { method: 'DELETE' });
+        showToast(`${key} gelöscht`);
+        jiraCloseModal();
+        jiraLoad({ silent: true });
+      } catch (err) { showToast(err.message, true); }
+    });
+  }
+
+  /* ----- Sprints ----- */
+  function jiraOpenSprintForm(sprint = null, { start = false } = {}) {
+    const today = new Date();
+    const nextFriday = new Date(today);
+    nextFriday.setDate(today.getDate() + ((5 - today.getDay() + 7) % 7 || 7));
+    const startValue = jiraDateInput(sprint?.startDate) || jiraDateInput(today);
+    const endValue = jiraDateInput(sprint?.endDate) || jiraDateInput(nextFriday);
+    const nextNumber = jiraState.sprints.length + 1;
+
+    const body = jiraShowModal(`
+      <h2>${start ? 'Sprint starten' : sprint ? 'Sprint bearbeiten' : 'Neuer Sprint'}</h2>
+      <form id="jiraSprintForm" novalidate>
+        <div class="field">
+          <label for="jsName">Name* (max. 30 Zeichen)</label>
+          <input type="text" id="jsName" maxlength="30" required value="${jiraAttr(sprint?.name || `Sprint ${nextNumber}`)}">
+        </div>
+        <div class="field">
+          <label for="jsGoal">Sprintziel</label>
+          <textarea id="jsGoal" rows="3">${escapeHtml(sprint?.goal || '')}</textarea>
+        </div>
+        <div class="field-row">
+          <div class="field"><label for="jsStart">Start</label><input type="date" id="jsStart" value="${jiraAttr(startValue)}"></div>
+          <div class="field"><label for="jsEnd">Ende${start ? '*' : ''}</label><input type="date" id="jsEnd" value="${jiraAttr(endValue)}"></div>
+        </div>
+        ${start ? `<p class="modal-note">Der Sprint wird in Jira gestartet. ${jiraActiveSprints().length ? 'Achtung: Es läuft bereits ein Sprint – Jira erlaubt parallele Sprints nur, wenn das im Board aktiviert ist.' : ''}</p>` : ''}
+        <div class="modal-actions">
+          <button type="button" class="btn" data-close>Abbrechen</button>
+          <button type="submit" class="btn btn-primary" id="jsSubmit">${start ? 'Sprint starten' : sprint ? 'Speichern' : 'Anlegen'}</button>
+        </div>
+      </form>
+    `);
+    body.querySelector('#jsName').focus();
+    body.querySelector('#jiraSprintForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const payload = {
+        name: body.querySelector('#jsName').value.trim(),
+        goal: body.querySelector('#jsGoal').value.trim(),
+        startDate: jiraDateToIso(body.querySelector('#jsStart').value, 8),
+        endDate: jiraDateToIso(body.querySelector('#jsEnd').value, 16),
+      };
+      if (!payload.name) { showToast('Bitte einen Namen eingeben', true); return; }
+      if (payload.startDate && payload.endDate && payload.endDate <= payload.startDate) { showToast('Das Ende muss nach dem Start liegen', true); return; }
+      if (start && !payload.endDate) { showToast('Zum Starten wird ein Enddatum benötigt', true); return; }
+      const submit = body.querySelector('#jsSubmit');
+      submit.disabled = true;
+      try {
+        if (sprint) {
+          await jiraApi(`/sprints/${sprint.id}`, { method: 'PUT', body: { ...payload, ...(start ? { state: 'active' } : {}) } });
+          if (start) jiraState.boardSprintId = sprint.id;
+          showToast(start ? `${payload.name} gestartet` : 'Sprint gespeichert');
+        } else {
+          await jiraApi('/sprints', { method: 'POST', body: payload });
+          showToast(`${payload.name} angelegt`);
+        }
+        jiraCloseModal();
+        jiraLoad({ silent: true });
+      } catch (err) {
+        showToast(err.message, true);
+        submit.disabled = false;
+      }
+    });
+  }
+
+  function jiraOpenCloseSprint(sprint) {
+    if (!sprint) return;
+    const issues = (jiraState.issuesBySprint[sprint.id] || []).filter(i => !i.type?.subtask);
+    const open = issues.filter(i => i.status?.category !== 'done');
+    const futures = jiraState.sprints.filter(s => s.state === 'future');
+    const body = jiraShowModal(`
+      <h2>${escapeHtml(sprint.name)} abschließen</h2>
+      <p class="modal-note" style="margin-top:0">${issues.length - open.length} von ${issues.length} Aufgaben sind erledigt.</p>
+      ${open.length ? `
+        <div class="field">
+          <label for="jcTarget">${open.length} offene Aufgabe${open.length === 1 ? '' : 'n'} verschieben nach</label>
+          <select id="jcTarget">
+            <option value="backlog">Backlog</option>
+            ${futures.map(s => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('')}
+          </select>
+        </div>` : ''}
+      <div class="modal-actions">
+        <button type="button" class="btn" data-close>Abbrechen</button>
+        <button type="button" class="btn btn-primary" id="jcSubmit">Sprint abschließen</button>
+      </div>
+    `);
+    body.querySelector('#jcSubmit').addEventListener('click', async () => {
+      const target = body.querySelector('#jcTarget')?.value || 'backlog';
+      body.querySelector('#jcSubmit').disabled = true;
+      try {
+        await jiraApi(`/sprints/${sprint.id}`, { method: 'PUT', body: { state: 'closed', moveOpenTo: target === 'backlog' ? 'backlog' : Number(target) } });
+        showToast(`${sprint.name} abgeschlossen`);
+        jiraCloseModal();
+        jiraLoad({ silent: true });
+      } catch (err) {
+        showToast(err.message, true);
+        body.querySelector('#jcSubmit').disabled = false;
+      }
+    });
+  }
+
+  async function jiraDeleteSprint(sprint) {
+    if (!sprint) return;
+    if (!confirm(`Sprint „${sprint.name}“ löschen? Die Aufgaben darin wandern zurück ins Backlog.`)) return;
+    try {
+      await jiraApi(`/sprints/${sprint.id}`, { method: 'DELETE' });
+      showToast('Sprint gelöscht');
+      jiraLoad({ silent: true });
+    } catch (err) { showToast(err.message, true); }
+  }
+
+  /* ----- Zuordnung Portal -> Jira (Admin) ----- */
+  function jiraOpenMapping() {
+    const meta = jiraState.meta;
+    if (!meta?.canManage) return;
+    const body = jiraShowModal(`
+      <h2>Zuordnung Portal ↔ Jira</h2>
+      <p class="modal-note" style="margin-top:0">Wird automatisch über den Namen erkannt. Wenn das nicht passt, hier den richtigen Jira-Account wählen.</p>
+      ${meta.mapping.map(m => `
+        <div class="jira-map-row">
+          <div><strong>${escapeHtml(m.name)}</strong><small>@${escapeHtml(m.username)}${m.auto ? (m.accountId ? ' · automatisch erkannt' : ' · nicht erkannt') : ' · manuell'}</small></div>
+          <select class="jira-inline-select" data-map-user="${m.userId}">
+            <option value="__auto" ${m.auto ? 'selected' : ''}>Automatisch</option>
+            <option value="" ${!m.auto && !m.accountId ? 'selected' : ''}>Kein Jira-Account</option>
+            ${jiraUsers().map(u => `<option value="${jiraAttr(u.accountId)}" ${!m.auto && m.accountId === u.accountId ? 'selected' : ''}>${escapeHtml(u.displayName)}</option>`).join('')}
+          </select>
+        </div>`).join('')}
+      <div class="modal-actions"><button type="button" class="btn btn-primary" data-close>Fertig</button></div>
+    `);
+    body.querySelectorAll('[data-map-user]').forEach(sel => sel.addEventListener('change', async () => {
+      try {
+        const payload = sel.value === '__auto' ? { auto: true } : { accountId: sel.value || null };
+        await jiraApi(`/mapping/${sel.dataset.mapUser}`, { method: 'PUT', body: payload });
+        jiraState.meta = await jiraApi('/meta');
+        showToast('Zuordnung gespeichert');
+        jiraRebuildViews();
+        jiraRenderChrome();
+        jiraRenderContent();
+      } catch (err) { showToast(err.message, true); }
+    }));
+  }
+
+
+  if (await requireSession()) renderJiraPage();
+</script>
+</body>
+</html>

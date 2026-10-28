@@ -1,0 +1,62 @@
+/* ---------- Dashboard (Startseite) ---------- */
+.st-page { width: calc(100% - 32px); max-width: 1600px; margin: 0 auto 40px; }
+.st-hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; padding: 24px 28px; margin-bottom: 14px; border: 1px solid var(--border); border-radius: 18px; background: var(--panel); flex-wrap: wrap; }
+.st-hero h2 { margin: 4px 0 6px; font-size: 28px; }
+.st-eyebrow { font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
+.st-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.st-actions a.btn { text-decoration: none; }
+.st-muted { color: var(--text-soft); margin: 0; font-size: 13.5px; }
+.st-small { font-size: 12px; white-space: nowrap; }
+
+.st-grid { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+.st-col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.st-card { border: 1px solid var(--border); border-radius: 18px; background: var(--panel); padding: 18px 20px; min-width: 0; }
+.st-card h3 { margin: 0 0 12px; font-size: 15px; }
+.st-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.st-link, .st-more { font-size: 12.5px; color: var(--accent); text-decoration: none; font-weight: 650; }
+.st-more { display: inline-block; margin-top: 8px; }
+
+.st-sprint-name { font-size: 22px; font-weight: 750; letter-spacing: -.01em; }
+.st-goal { margin-top: 4px; max-width: 900px; }
+.st-progress { height: 10px; border-radius: 999px; background: color-mix(in srgb, var(--text) 10%, transparent); overflow: hidden; margin: 16px 0 14px; }
+.st-progress span { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+.st-sprint-stats { display: flex; flex-wrap: wrap; gap: 26px; align-items: center; }
+.st-sprint-stats strong { display: block; font-size: 18px; }
+.st-sprint-stats small { color: var(--text-soft); font-size: 12px; }
+.st-cats { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+.st-cat, .st-status { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 700; white-space: nowrap; background: color-mix(in srgb, var(--text) 9%, transparent); color: var(--text-soft); }
+.st-cat.c-indeterminate, .st-status.c-indeterminate { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }
+.st-cat.c-done, .st-status.c-done { background: color-mix(in srgb, #2BA471 18%, transparent); color: #2BA471; }
+
+.st-list { display: flex; flex-direction: column; }
+.st-row { display: flex; align-items: center; gap: 10px; padding: 8px 8px; margin: 0 -8px; border-radius: 9px; color: var(--text); text-decoration: none; font-size: 13.5px; }
+.st-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.st-key { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-soft); flex-shrink: 0; }
+.st-row-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.st-doc-icon { flex-shrink: 0; }
+.st-due { font-size: 11.5px; font-weight: 700; color: var(--text-soft); white-space: nowrap; }
+.st-due.is-soon { color: #E6A23C; }
+.st-due.is-late { color: var(--alarm); }
+
+.st-avatar { border-radius: 50%; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 800; color: #fff; background: var(--slate); overflow: hidden; }
+.st-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.st-avatar.is-empty { background: transparent; border: 1px dashed var(--border-strong); color: var(--text-soft); }
+
+.st-team { display: flex; flex-direction: column; gap: 10px; }
+.st-person { display: flex; align-items: center; gap: 10px; }
+.st-person-main { flex: 1; min-width: 0; }
+.st-person-name { font-size: 13px; font-weight: 600; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.st-stack { display: flex; height: 7px; border-radius: 999px; overflow: hidden; background: color-mix(in srgb, var(--text) 8%, transparent); }
+.st-stack .c-new { background: color-mix(in srgb, var(--text) 25%, transparent); }
+.st-stack .c-indeterminate { background: var(--accent); }
+.st-stack .c-done { background: #2BA471; }
+.st-person-count { font-size: 12px; color: var(--text-soft); font-variant-numeric: tabular-nums; }
+
+@media (max-width: 1000px) {
+  .st-grid { grid-template-columns: 1fr; }
+  .st-cats { margin-left: 0; }
+}
+@media (max-width: 640px) {
+  .st-page { width: calc(100% - 20px); }
+  .st-hero { padding: 20px; }
+}

@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboard</title>
+<script src="/config.js"></script>
+<link rel="stylesheet" href="/assets/common.css">
+<link rel="stylesheet" href="/assets/dashboard.css">
+<script>try { if (localStorage.getItem('darkMode') === 'true') document.documentElement.setAttribute('data-theme', 'dark'); } catch {}</script>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="toastRegion" class="toast-region" aria-live="polite"></div>
+<script type="module">
+  import {
+    APP,
+    appTitle,
+    hasModule,
+    bindHeader,
+    escapeHtml,
+    fetchJson,
+    headerHTML,
+    loadJiraMirror,
+    openGlobalSearch,
+    requireSession,
+    state,
+  } from '/assets/common.js';
+
+  /* ---------- Hilfen ---------- */
+  function attr(value) {
+    return escapeHtml(value).replace(/"/g, '&quot;');
+  }
+
+  function parseDate(value) {
+    if (!value) return null;
+    const s = String(value);
+    // SQLite liefert "YYYY-MM-DD HH:MM:SS" in UTC ohne Zeitzone
+    const d = new Date(/^\d{4}-\d{2}-\d{2} \d/.test(s) ? s.replace(' ', 'T') + 'Z' : s);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  function relative(value) {
+    const d = parseDate(value);
+    if (!d) return '';
+    const min = Math.round((Date.now() - d.getTime()) / 60000);
+    if (min < 1) return 'gerade eben';
+    if (min < 60) return `vor ${min} min`;
+    const h = Math.round(min / 60);
+    if (h < 24) return `vor ${h} h`;
+    const days = Math.round(h / 24);
+    if (days < 7) return `vor ${days} Tag${days === 1 ? '' : 'en'}`;
+    return new Intl.DateTimeFormat('de-DE', { dateStyle: 'medium' }).format(d);
+  }
+
+  function dayDiff(dateStr) {
+    const [y, m, d] = String(dateStr).split('-').map(Number);
+    const due = new Date(y, m - 1, d);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    return Math.round((due - today) / 86400000);
+  }
+
+  function initials(name) {
+    return String(name || '?').split(/\s+/).filter(Boolean).slice(0, 2).map(p => p[0].toUpperCase()).join('') || '?';
+  }
+
+  function avatar(user, size = 26) {
+    if (!user) return `<span class="st-avatar is-empty" style="width:${size}px;height:${size}px">?</span>`;
+    if (user.avatarUrl && /^https:\/\//.test(user.avatarUrl)) {
+      return `<span class="st-avatar" style="width:${size}px;height:${size}px" title="${attr(user.displayName)}"><img src="${attr(user.avatarUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer"></span>`;
+    }
+    return `<span class="st-avatar" style="width:${size}px;height:${size}px" title="${attr(user.displayName)}">${escapeHtml(initials(user.displayName))}</span>`;
+  }
+
+  function statusPill(status) {
+    if (!status) return '';
+    return `<span class="st-status c-${attr(status.category)}">${escapeHtml(status.name)}</span>`;
+  }
+
+  function greeting() {
+    const h = new Date().getHours();
+    if (h < 11) return 'Guten Morgen';
+    if (h < 18) return 'Hallo';
+    return 'Guten Abend';
+  }
+
+  function issueRow(issue, extra = '') {
+    return `
+      <a class="st-row" href="/sprints?issue=${encodeURIComponent(issue.key)}">
+        <span class="st-key">${escapeHtml(issue.key)}</span>
+        <span class="st-row-title">${escapeHtml(issue.summary)}</span>
+        ${extra}
+        ${statusPill(issue.status)}
+      </a>`;
+  }
+
+  // Das Dashboard zeigt nur Aufgaben aus dem aktuell laufenden Sprint
+  function sprintIssues(mirror) {
+    if (!mirror) return [];
+    return [...mirror.issues.values()].filter(i => i.sprint?.state === 'active' && i.type?.name !== 'Epic');
+  }
+
+  function hasActiveSprint(mirror) {
+    return Boolean(mirror?.sprints.some(sp => sp.state === 'active'));
+  }
+
+  /* ---------- Karten ---------- */
+  function sprintCard(mirror) {
+    if (!mirror) {
+      return `<section class="st-card st-sprint"><h3>Aktueller Sprint</h3><p class="st-muted">Jira ist gerade nicht erreichbar oder nicht verbunden.</p></section>`;
+    }
+    const sprint = mirror.sprints.find(sp => sp.state === 'active');
+    if (!sprint) {
+      return `<section class="st-card st-sprint"><h3>Aktueller Sprint</h3><p class="st-muted">Gerade läuft kein Sprint. <a href="/sprints">Sprint planen →</a></p></section>`;
+    }
+    const all = [...mirror.issues.values()].filter(i => i.sprint?.id === sprint.id && i.type?.name !== 'Epic');
+    const parents = all.filter(i => !i.type?.subtask);
+    const done = parents.filter(i => i.status?.category === 'done').length;
+    const pct = parents.length ? Math.round(done / parents.length * 100) : 0;
+    const points = parents.reduce((s, i) => s + (Number(i.storyPoints) || 0), 0);
+    const pointsDone = parents.filter(i => i.status?.category === 'done').reduce((s, i) => s + (Number(i.storyPoints) || 0), 0);
+    const byCat = { new: 0, indeterminate: 0, done: 0 };
+    for (const i of all) byCat[i.status?.category || 'new'] = (byCat[i.status?.category || 'new'] || 0) + 1;
+    const daysLeft = sprint.endDate ? Math.ceil((new Date(sprint.endDate) - Date.now()) / 86400000) : null;
+    const daysText = daysLeft === null ? '' : daysLeft < 0 ? `seit ${-daysLeft} Tag${daysLeft === -1 ? '' : 'en'} überfällig` : daysLeft === 0 ? 'endet heute' : `noch ${daysLeft} Tag${daysLeft === 1 ? '' : 'e'}`;
+    const fmt = v => v ? new Intl.DateTimeFormat('de-DE', { dateStyle: 'medium' }).format(new Date(v)) : '—';
+    return `
+      <section class="st-card st-sprint">
+        <div class="st-card-head">
+          <h3>Aktueller Sprint</h3>
+          <a href="/sprints" class="st-link">Zum Board →</a>
+        </div>
+        <div class="st-sprint-name">${escapeHtml(sprint.name)}</div>
+        ${sprint.goal ? `<p class="st-muted st-goal">${escapeHtml(sprint.goal)}</p>` : ''}
+        <div class="st-progress"><span style="width:${pct}%"></span></div>
+        <div class="st-sprint-stats">
+          <div><strong>${pct} %</strong><small>${done}/${parents.length} Aufgaben erledigt</small></div>
+          ${points ? `<div><strong>${pointsDone}/${points}</strong><small>Story Points</small></div>` : ''}
+          <div><strong>${escapeHtml(daysText || '—')}</strong><small>${fmt(sprint.startDate)} – ${fmt(sprint.endDate)}</small></div>
+          <div class="st-cats">
+            <span class="st-cat c-new">${byCat.new} offen</span>
+            <span class="st-cat c-indeterminate">${byCat.indeterminate} in Arbeit</span>
+            <span class="st-cat c-done">${byCat.done} erledigt</span>
+          </div>
+        </div>
+      </section>`;
+  }
+
+  function myTasksCard(mirror) {
+    const myId = mirror?.meta?.me?.accountId;
+    let body;
+    if (!mirror) body = '<p class="st-muted">Jira ist gerade nicht erreichbar.</p>';
+    else if (!myId) body = '<p class="st-muted">Dein Konto ist noch keinem Jira-Account zugeordnet (Sprints → Zuordnung).</p>';
+    else if (!hasActiveSprint(mirror)) body = '<p class="st-muted">Gerade läuft kein Sprint.</p>';
+    else {
+      const mine = sprintIssues(mirror)
+        .filter(i => i.assignee?.accountId === myId && i.status?.category !== 'done')
+        .sort((a, b) => {
+          const cat = { indeterminate: 0, new: 1 };
+          return (cat[a.status?.category] ?? 2) - (cat[b.status?.category] ?? 2) || (Number(a.priority?.id) || 9) - (Number(b.priority?.id) || 9);
+        });
+      body = mine.length
+        ? `<div class="st-list">${mine.slice(0, 8).map(i => issueRow(i)).join('')}</div>${mine.length > 8 ? `<a class="st-more" href="/sprints">+ ${mine.length - 8} weitere</a>` : ''}`
+        : '<p class="st-muted">Keine offenen Aufgaben im Sprint – stark! 🎉</p>';
+    }
+    return `<section class="st-card"><div class="st-card-head"><h3>Meine Aufgaben im Sprint</h3><a href="/sprints" class="st-link">Alle →</a></div>${body}</section>`;
+  }
+
+  function dueCard(mirror) {
+    let body;
+    if (!mirror) body = '<p class="st-muted">Jira ist gerade nicht erreichbar.</p>';
+    else if (!hasActiveSprint(mirror)) body = '<p class="st-muted">Gerade läuft kein Sprint.</p>';
+    else {
+      const due = sprintIssues(mirror)
+        .filter(i => i.duedate && i.status?.category !== 'done' && dayDiff(i.duedate) <= 7)
+        .sort((a, b) => a.duedate.localeCompare(b.duedate));
+      body = due.length
+        ? `<div class="st-list">${due.slice(0, 8).map(i => {
+            const d = dayDiff(i.duedate);
+            const label = d < 0 ? `${-d} T überfällig` : d === 0 ? 'heute' : d === 1 ? 'morgen' : `in ${d} T`;
+            return issueRow(i, `<span class="st-due${d < 0 ? ' is-late' : d <= 1 ? ' is-soon' : ''}">${label}</span>${avatar(i.assignee, 22)}`);
+          }).join('')}</div>`
+        : '<p class="st-muted">Im Sprint ist nichts in den nächsten 7 Tagen fällig.</p>';
+    }
+    return `<section class="st-card"><div class="st-card-head"><h3>Fällig &amp; überfällig im Sprint</h3></div>${body}</section>`;
+  }
+
+  function teamCard(mirror) {
+    const sprint = mirror?.sprints.find(sp => sp.state === 'active');
+    if (!mirror || !sprint) return '';
+    const people = new Map();
+    for (const u of mirror.meta.users || []) people.set(u.accountId, { user: u, open: 0, progress: 0, done: 0 });
+    const unassigned = { user: null, open: 0, progress: 0, done: 0 };
+    for (const i of mirror.issues.values()) {
+      if (i.sprint?.id !== sprint.id || i.type?.name === 'Epic') continue;
+      const slot = (i.assignee && people.get(i.assignee.accountId)) || (i.assignee ? null : unassigned);
+      if (!slot) continue;
+      const cat = i.status?.category;
+      if (cat === 'done') slot.done++; else if (cat === 'indeterminate') slot.progress++; else slot.open++;
+    }
+    const rows = [...people.values(), unassigned].filter(p => p.open + p.progress + p.done > 0)
+      .sort((a, b) => (b.open + b.progress) - (a.open + a.progress));
+    if (!rows.length) return '';
+    return `
+      <section class="st-card">
+        <div class="st-card-head"><h3>Team im Sprint</h3></div>
+        <div class="st-team">
+          ${rows.map(p => {
+            const total = p.open + p.progress + p.done;
+            return `
+              <div class="st-person">
+                ${avatar(p.user, 28)}
+                <div class="st-person-main">
+                  <div class="st-person-name">${escapeHtml(p.user?.displayName || 'Nicht zugewiesen')}</div>
+                  <div class="st-stack" title="${p.open} offen · ${p.progress} in Arbeit · ${p.done} erledigt">
+                    <span class="c-new" style="flex:${p.open}"></span><span class="c-indeterminate" style="flex:${p.progress}"></span><span class="c-done" style="flex:${p.done}"></span>
+                  </div>
+                </div>
+                <span class="st-person-count">${p.done}/${total}</span>
+              </div>`;
+          }).join('')}
+        </div>
+      </section>`;
+  }
+
+  function docsCard(docs) {
+    const list = [...(docs || [])].sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || ''))).slice(0, 7);
+    const body = list.length
+      ? `<div class="st-list">${list.map(d => `
+          <a class="st-row" href="/dokumentation?doc=${d.id}">
+            <span class="st-doc-icon">📄</span>
+            <span class="st-row-title">${escapeHtml(d.title)}</span>
+            <span class="st-muted st-small">${escapeHtml(relative(d.updated_at || d.created_at))}</span>
+          </a>`).join('')}</div>`
+      : '<p class="st-muted">Noch keine Dokumente.</p>';
+    return `<section class="st-card"><div class="st-card-head"><h3>Zuletzt geänderte Dokumente</h3><a href="/dokumentation" class="st-link">Alle →</a></div>${body}</section>`;
+  }
+
+  /* ---------- Seite ---------- */
+  async function renderStartPage() {
+    document.body.classList.add('page-wide');
+    const user = state.currentUser || {};
+    const name = user.first_name || user.username || '';
+    const withSprints = hasModule('sprints');
+    const withDocs = hasModule('docs');
+    const today = new Intl.DateTimeFormat('de-DE', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).format(new Date());
+    document.getElementById('app').innerHTML = `
+      ${headerHTML({ title: appTitle('Dashboard'), current: 'dashboard' })}
+      <main class="st-page">
+        <section class="st-hero">
+          <div>
+            <div class="st-eyebrow">${escapeHtml(today)}</div>
+            <h2>${greeting()}${name ? `, ${escapeHtml(name)}` : ''}!</h2>
+            <p class="st-muted" id="stSummary">Lade Überblick …</p>
+          </div>
+          <div class="st-actions">
+            ${withSprints ? '<a class="btn btn-primary" href="/sprints?new=1">+ Aufgabe</a>' : ''}
+            ${withDocs ? `<a class="btn${withSprints ? '' : ' btn-primary'}" href="/dokumentation?new=1">+ Dokument</a>` : ''}
+            <button type="button" class="btn" id="stSearch">Suchen</button>
+          </div>
+        </section>
+        <div class="st-grid" id="stGrid"><div class="st-card st-muted">Lade …</div></div>
+      </main>
+    `;
+    bindHeader();
+    document.getElementById('stSearch').addEventListener('click', () => openGlobalSearch());
+
+    const [mirror, docsRes] = await Promise.all([
+      withSprints ? loadJiraMirror() : null,
+      withDocs ? fetchJson('/api/docs?light=1').catch(() => ({ res: { ok: false } })) : { res: { ok: false } },
+    ]);
+    const docs = docsRes.res.ok && Array.isArray(docsRes.data) ? docsRes.data : [];
+
+    const grid = document.getElementById('stGrid');
+    grid.innerHTML = withSprints ? `
+      <div class="st-col st-col-wide">${sprintCard(mirror)}${myTasksCard(mirror)}</div>
+      <div class="st-col">${dueCard(mirror)}${teamCard(mirror)}${withDocs ? docsCard(docs) : ''}</div>
+    ` : `<div class="st-col st-col-wide">${docsCard(docs)}</div>`;
+
+    const myId = mirror?.meta?.me?.accountId;
+    const current = sprintIssues(mirror);
+    const openMine = myId && hasActiveSprint(mirror) ? current.filter(i => i.assignee?.accountId === myId && i.status?.category !== 'done').length : null;
+    const overdue = current.filter(i => i.duedate && i.status?.category !== 'done' && dayDiff(i.duedate) < 0).length;
+    const parts = [];
+    if (openMine !== null) parts.push(`${openMine} offene Aufgabe${openMine === 1 ? '' : 'n'} für dich im Sprint`);
+    else if (withSprints && mirror && !hasActiveSprint(mirror)) parts.push('Gerade läuft kein Sprint');
+    if (overdue) parts.push(`${overdue} überfällig`);
+    if (withDocs) parts.push(`${docs.length} Dokumente`);
+    document.getElementById('stSummary').textContent = parts.join(' · ');
+  }
+
+  if (await requireSession()) renderStartPage();
+</script>
+</body>
+</html>

@@ -1,0 +1,2108 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Anmelden</title>
+<script src="/config.js"></script>
+<link rel="stylesheet" href="/assets/common.css">
+<script>try { if (localStorage.getItem('darkMode') === 'true') document.documentElement.setAttribute('data-theme', 'dark'); } catch {}</script>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="toastRegion" class="toast-region" aria-live="polite"></div>
+<script type="module">
+  import {
+    APP,
+    HOME_PATH,
+    appTitle,
+    hasModule,
+    onSearchNavigate,
+    CLIPBOARD_CLEAR_MS,
+    ICONS,
+    SCRUM_ROLE_VALUES,
+    USER_ROLE_VALUES,
+    base64urlToBuffer,
+    bindExtensionModal,
+    bindHeader,
+    bufferToBase64url,
+    canManageUsers,
+    closeDialog,
+    errorMessage,
+    escapeHtml,
+    fetchJson,
+    formatDate,
+    glyphSVG,
+    handleUnauthorized,
+    headerHTML,
+    hostnameOf,
+    maskOf,
+    nextTarget,
+    openDialog,
+    openExtensionModal,
+    reducedMotion,
+    roleLabel,
+    scrumRoleLabel,
+    setCurrentUser,
+    setLogoutHandler,
+    showToast,
+    startInactivityMonitor,
+    startTotpTicker,
+    state,
+    totpCode,
+    userDisplayName,
+  } from '/assets/common.js';
+
+  const APP_SLUG_LOGIN = APP.name.toLowerCase().replace(/\s+/g, '-');
+  const LOGIN_TAGLINE = [hasModule('docs') && 'Dokumentation', hasModule('sprints') && 'Sprints', hasModule('ai') && 'KI Anbindung'].filter(Boolean).join(', ') || 'Teamportal';
+
+  /* ---------- Login ---------- */
+  function renderLogin() {
+    const app = document.getElementById('app');
+    const autoLoggedOut = sessionStorage.getItem('autoLoggedOut');
+    if (autoLoggedOut) sessionStorage.removeItem('autoLoggedOut');
+    app.innerHTML = `
+      <div class="login-shell">
+        <div class="login-card" id="loginCard">
+          <section class="login-visual" aria-hidden="true">
+            <div class="login-visual-top">
+              ${glyphSVG({ size: 38, animate: !reducedMotion })}
+              <span class="login-visual-kicker">auth-gateway / ${escapeHtml(APP_SLUG_LOGIN)}</span>
+            </div>
+            <div class="auth-diagram"><span class="auth-key">KEY: 7F-2A-C9</span></div>
+            <p class="login-visual-copy">${hasModule('vault') ? '<strong>Security Operations Console</strong><span>Zugänge prüfen, TOTP lesen, Secrets kontrolliert freigeben.</span>' : `<strong>${escapeHtml(APP.name)}</strong><span>${escapeHtml(LOGIN_TAGLINE)}</span>`}</p>
+          </section>
+          <section class="login-form-panel">
+            <div class="glyph-wrap">${glyphSVG({ size: 42 })}</div>
+            <h1 class="brandmark">${escapeHtml(hasModule('vault') ? appTitle('Tresor') : APP.name)}</h1>
+            <p class="lede">${hasModule('vault') ? 'Melde dich an, um die Credential-Konsole zu entsperren.' : 'Melde dich mit deinem Konto an.'}</p>
+            ${autoLoggedOut ? `<p class="auto-logout-note">Du wurdest wegen Inaktivität abgemeldet.</p>` : ''}
+            <form id="loginForm" novalidate>
+              <div class="field">
+                <label for="username">Benutzername</label>
+                <input type="text" id="username" name="username" autocomplete="username" required>
+              </div>
+              <div class="field">
+                <label for="password">Passwort</label>
+                <input type="password" id="password" name="password" autocomplete="current-password" required>
+              </div>
+              <button type="submit" class="btn btn-primary btn-block">${hasModule('vault') ? 'Konsole entsperren' : 'Anmelden'}</button>
+            </form>
+            <div class="login-divider"><span>oder</span></div>
+            <button type="button" class="btn btn-block" id="btnPasskeyLogin">Mit Passkey anmelden</button>
+            ${hasModule('vault') ? '<p class="login-extension-link"><button type="button" class="link-btn" id="btnLoginExtension">Browser-Erweiterung installieren</button></p>' : ''}
+            <div id="loginError" class="error-msg" role="alert" aria-live="assertive"></div>
+          </section>
+        </div>
+      </div>
+    `;
+
+    if (hasModule('vault')) {
+      bindExtensionModal();
+      document.getElementById('btnLoginExtension').addEventListener('click', openExtensionModal);
+    }
+
+    const btnPasskeyLogin = document.getElementById('btnPasskeyLogin');
+    if (!window.PublicKeyCredential) {
+      btnPasskeyLogin.disabled = true;
+      btnPasskeyLogin.title = 'Dieser Browser unterstützt keine Passkeys.';
+    }
+    btnPasskeyLogin.addEventListener('click', async () => {
+      const errorEl = document.getElementById('loginError');
+      errorEl.textContent = '';
+      try {
+        const optRes = await fetch('/api/webauthn/login/options', { method: 'POST' });
+        if (!optRes.ok) throw new Error((await optRes.json().catch(() => ({}))).error || 'Passkey-Login nicht verfügbar.');
+        const { opId, options } = await optRes.json();
+        options.challenge = base64urlToBuffer(options.challenge);
+        if (Array.isArray(options.allowCredentials)) {
+          options.allowCredentials = options.allowCredentials.map(c => ({ ...c, id: base64urlToBuffer(c.id) }));
+        }
+        const credential = await navigator.credentials.get({ publicKey: options });
+        const payload = {
+          id: credential.id,
+          rawId: bufferToBase64url(credential.rawId),
+          type: credential.type,
+          response: {
+            clientDataJSON: bufferToBase64url(credential.response.clientDataJSON),
+            authenticatorData: bufferToBase64url(credential.response.authenticatorData),
+            signature: bufferToBase64url(credential.response.signature),
+            userHandle: credential.response.userHandle ? bufferToBase64url(credential.response.userHandle) : null,
+          },
+          clientExtensionResults: credential.getClientExtensionResults(),
+        };
+        const verifyRes = await fetch('/api/webauthn/login/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ opId, response: payload })
+        });
+        const data = await verifyRes.json();
+        if (!verifyRes.ok) throw new Error(data.error || 'Passkey-Anmeldung fehlgeschlagen.');
+
+        state.token = data.token;
+        setCurrentUser(data.user);
+        localStorage.setItem('token', state.token);
+        afterLogin({ fresh: true });
+      } catch (err) {
+        if (err?.name === 'NotAllowedError' || err?.name === 'AbortError') return;
+        errorEl.textContent = err.message || 'Passkey-Anmeldung fehlgeschlagen.';
+      }
+    });
+
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const username = document.getElementById('username').value;
+      const password = document.getElementById('password').value;
+      const errorEl = document.getElementById('loginError');
+      errorEl.textContent = '';
+
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password })
+        });
+        const data = await res.json();
+
+        if (res.ok) {
+          state.token = data.token;
+          setCurrentUser(data.user);
+          localStorage.setItem('token', state.token);
+          afterLogin({ fresh: true });
+        } else {
+          errorEl.textContent = data.error === 'Invalid credentials'
+            ? 'Benutzername oder Passwort stimmen nicht überein.'
+            : (data.error || 'Anmeldung fehlgeschlagen.');
+        }
+      } catch (err) {
+        errorEl.textContent = 'Keine Verbindung zum Server möglich.';
+      }
+    });
+  }
+
+  let clipboardClearTimer = null;
+
+  /* ---------- Vault ---------- */
+  const LOCK_ICON = '<svg viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="9" width="12" height="8.5" rx="2"/><path d="M6.8 9V6.6a3.2 3.2 0 0 1 6.4 0V9"/></svg>';
+  const LOCK_OPEN_ICON = '<svg viewBox="0 0 20 20" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="9" width="12" height="8.5" rx="2"/><path d="M6.8 9V6.6a3.2 3.2 0 0 1 6.2-1.1"/></svg>';
+
+  function renderVault() {
+    // Ohne Tresor ist die Startseite nur Anmeldung und Benutzerverwaltung
+    if (!hasModule('vault')) { window.location.replace(HOME_PATH === '/' ? '/?admin=1' : HOME_PATH); return; }
+    document.title = appTitle('Tresor');
+    document.body.classList.add('page-wide');
+    const app = document.getElementById('app');
+    app.innerHTML = `
+      ${headerHTML({ title: appTitle('Tresor'), current: 'vault', controls: `
+          <button type="button" class="btn folder-drawer-trigger" id="btnFolderDrawer">Ordner</button>
+          <div class="search-field">
+            <label class="sr-only" for="searchInput">Einträge durchsuchen</label>
+            <input type="search" id="searchInput" placeholder="Credential, Benutzername, Notiz suchen">
+          </div>
+          <button class="btn btn-primary" id="btnNew">Neuer Eintrag</button>
+          ${canManageUsers() ? '<button class="btn" id="btnUsers">Admin</button>' : ''}` })}
+
+      <div class="app-shell">
+        <h2 class="sr-only">Gespeicherte Zugangsdaten</h2>
+        <div class="vault-layout">
+          <aside class="folder-sidebar" id="folderSidebar" aria-label="Ordner"></aside>
+          <main class="vault-main">
+            <div class="vault-main-head">
+              <div>
+                <h2 class="vault-main-title" id="vaultMainTitle">Credential-Konsole</h2>
+                <p class="vault-mode-note" id="vaultModeNote" hidden>${LOCK_ICON}<span>Nur du siehst diese Einträge. Andere Mitglieder, Admins und die KI haben keinen Zugriff.</span></p>
+              </div>
+            </div>
+            <ul class="entry-list" id="entryList"></ul>
+            <div id="emptyState"></div>
+          </main>
+        </div>
+      </div>
+
+      <div id="folderDrawer" class="folder-drawer-overlay" hidden>
+        <aside class="folder-drawer-panel" id="folderDrawerPanel" role="dialog" aria-modal="true" aria-label="Ordner"></aside>
+      </div>
+
+      <div id="entryModal" class="modal-overlay" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="entryModalTitle">
+          <h2 id="entryModalTitle">Neuer Eintrag</h2>
+          <form id="entryForm" novalidate>
+            <input type="hidden" id="editId">
+            <div class="field">
+              <label for="entryName">Eintrag*</label>
+              <input type="text" id="entryName" required>
+            </div>
+            <div class="field">
+              <label for="entryFolder">Ordner</label>
+              <select id="entryFolder">
+                <option value="">Kein Ordner</option>
+              </select>
+            </div>
+            <div class="field vault-private-field" id="entryPrivateField" hidden>
+              <label class="vault-private-toggle" for="entryPrivate">
+                <input type="checkbox" id="entryPrivate">
+                <span>Im privaten Tresor speichern<small>Dann siehst nur du diesen Eintrag.</small></span>
+              </label>
+            </div>
+            <div class="field">
+              <label for="entryUrl">URL</label>
+              <input type="url" id="entryUrl" placeholder="https://…">
+            </div>
+            <div class="field">
+              <label for="entryUsername">Benutzername*</label>
+              <input type="text" id="entryUsername" required>
+            </div>
+            <div class="field">
+              <label for="entryPassword">Passwort<span id="pwRequiredMark">*</span></label>
+              <input type="password" id="entryPassword" autocomplete="new-password">
+            </div>
+            <button type="button" class="btn generator-trigger" id="btnToggleGenerator" aria-expanded="false" aria-controls="pwGeneratorPanel"></button>
+            <div class="generator-panel" id="pwGeneratorPanel" hidden>
+              <div class="generator-length">
+                <div class="generator-length-head">
+                  <label for="genLength">Länge</label>
+                  <span class="generator-length-value mono" id="genLengthValue">20 Zeichen</span>
+                </div>
+                <div class="generator-length-controls">
+                  <input type="range" id="genLengthRange" min="8" max="64" value="20">
+                  <input type="number" id="genLength" min="8" max="64" value="20" class="mono">
+                </div>
+              </div>
+              <div class="generator-options" role="group" aria-label="Zeichenarten">
+                <label class="gen-chip"><input type="checkbox" id="genUpper" checked><span>Großbuchstaben <span class="mono">A–Z</span></span></label>
+                <label class="gen-chip"><input type="checkbox" id="genLower" checked><span>Kleinbuchstaben <span class="mono">a–z</span></span></label>
+                <label class="gen-chip"><input type="checkbox" id="genDigits" checked><span>Zahlen <span class="mono">0–9</span></span></label>
+                <label class="gen-chip"><input type="checkbox" id="genSymbols" checked><span>Sonderzeichen</span></label>
+                <label class="gen-chip gen-chip-wide"><input type="checkbox" id="genExcludeSimilar"><span>Ähnliche Zeichen ausschließen</span></label>
+              </div>
+              <p class="modal-note" id="genNoCharsetNote" hidden>Mindestens eine Zeichenart auswählen.</p>
+              <div class="generator-preview-row">
+                <div class="generator-preview-value">
+                  <input type="text" id="genPreview" readonly class="mono">
+                  <button type="button" class="btn btn-icon" id="genCopyPreview" aria-label="Generiertes Passwort kopieren" title="Passwort kopieren"></button>
+                </div>
+                <div class="generator-preview-actions">
+                  <button type="button" class="btn" id="genRoll">Neu würfeln</button>
+                  <button type="button" class="btn btn-primary" id="genApply">Übernehmen</button>
+                </div>
+              </div>
+              <p class="generator-entropy" id="genEntropy"></p>
+            </div>
+            <p class="modal-note" id="pwDuplicateNote" hidden></p>
+            <p class="modal-note" id="pwEditNote" hidden>Leer lassen, um das gespeicherte Passwort unverändert zu lassen. <button type="button" class="btn" id="btnViewHistory"></button></p>
+            <div class="field">
+              <label for="entryTotpSecret">TOTP-Secret (optional)</label>
+              <input type="text" id="entryTotpSecret" autocomplete="off">
+            </div>
+            <p class="modal-note" id="totpEditNote" hidden></p>
+            <div class="field">
+              <label for="entryNotes">Notiz</label>
+              <textarea id="entryNotes"></textarea>
+            </div>
+            <div class="modal-actions">
+              <button type="button" class="btn" id="btnCancelEntry">Abbrechen</button>
+              <button type="submit" class="btn btn-primary">Speichern</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <div id="folderModal" class="modal-overlay" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="folderModalTitle">
+          <h2 id="folderModalTitle">Neuen Ordner anlegen</h2>
+          <form id="folderForm" novalidate>
+            <div class="field">
+              <label for="folderName">Name</label>
+              <input type="text" id="folderName" required>
+            </div>
+            <div class="modal-actions">
+              <button type="button" class="btn" id="btnCancelFolder">Abbrechen</button>
+              <button type="submit" class="btn btn-primary" id="folderSubmitBtn">Anlegen</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <div id="historyModal" class="modal-overlay" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="historyModalTitle">
+          <h2 id="historyModalTitle">Passwortverlauf</h2>
+          <ul id="historyList"></ul>
+          <p class="modal-note" id="historyEmptyNote" hidden>Für diesen Eintrag wurde bisher kein Passwort geändert.</p>
+          <div class="modal-actions">
+            <button type="button" class="btn" id="btnCloseHistory">Schließen</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="entryContextMenu" class="context-menu" role="menu" hidden></div>
+      <div id="folderContextMenu" class="context-menu" role="menu" hidden></div>
+    `;
+
+    bindVaultEvents();
+    loadVaultData();
+  }
+
+  function renderAdmin() {
+    if (!canManageUsers()) {
+      if (!hasModule('vault')) { window.location.replace(HOME_PATH === '/' ? '/dashboard' : HOME_PATH); return; }
+      renderVault();
+      showToast('Du hast keine Berechtigung für die Nutzerverwaltung.', true);
+      return;
+    }
+    document.title = appTitle('Benutzer');
+    if (new URLSearchParams(window.location.search).has('admin')) history.replaceState(null, '', '/');
+
+    document.body.classList.add('page-wide');
+    const app = document.getElementById('app');
+    app.innerHTML = `
+      ${headerHTML({ title: hasModule('vault') ? `${appTitle('Tresor')} · Admin` : `${APP.name} · Benutzer`, current: hasModule('vault') ? 'vault' : 'users', controls: hasModule('vault') ? '<button type="button" class="btn" id="btnBackVault">Zurück zum Tresor</button>' : (HOME_PATH !== '/' ? `<a class="btn" href="${HOME_PATH}">Zur Startseite</a>` : '') })}
+
+      <main class="admin-shell">
+        <section class="admin-head">
+          <div class="admin-head-title">
+            <h2>Nutzer verwalten</h2>
+            <p>Teamzugänge anlegen, Rollen ändern und Passwörter zurücksetzen.</p>
+          </div>
+          <div class="admin-head-actions">
+            <button type="button" class="btn btn-primary" id="btnNewUser">Neuer Nutzer</button>
+          </div>
+        </section>
+        <div id="adminError" class="error-msg admin-error" role="alert" hidden></div>
+        <section id="usersRegion" aria-live="polite"></section>
+      </main>
+
+      <div id="userModal" class="modal-overlay" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="userModalTitle">
+          <h2 id="userModalTitle">Neuer Nutzer</h2>
+          <form id="userForm" novalidate>
+            <input type="hidden" id="userEditId">
+            <div class="user-form-grid">
+              <div class="field">
+                <label for="userFirstName">Vorname*</label>
+                <input type="text" id="userFirstName" autocomplete="given-name" required>
+              </div>
+              <div class="field">
+                <label for="userLastName">Nachname*</label>
+                <input type="text" id="userLastName" autocomplete="family-name" required>
+              </div>
+              <div class="field">
+                <label for="userUsername">Benutzername*</label>
+                <input type="text" id="userUsername" autocomplete="username" required>
+              </div>
+              <div class="field">
+                <label for="userEmail">E-Mail*</label>
+                <input type="email" id="userEmail" autocomplete="email" required>
+              </div>
+              <div class="field">
+                <label for="userRole">Rolle</label>
+                <select id="userRole">
+                  <option value="member">Mitglied</option>
+                  <option value="admin">Admin</option>
+                  <option value="owner">Owner</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="userScrumRole">Scrum-Rolle</label>
+                <select id="userScrumRole">
+                  <option value="developer">Developer</option>
+                  <option value="scrum_master">Scrum Master</option>
+                  <option value="product_owner">Product Owner</option>
+                  <option value="designer">Designer</option>
+                </select>
+              </div>
+              <div class="field field-wide">
+                <label for="userPassword">Passwort<span id="userPwRequiredMark">*</span></label>
+                <input type="password" id="userPassword" autocomplete="new-password" minlength="6">
+              </div>
+            </div>
+            <p class="modal-note" id="userPwEditNote" hidden>Leer lassen, um das Passwort unverändert zu lassen. Ein neues Passwort setzt den Zugang zurück.</p>
+            <div class="error-msg" id="userFormError" role="alert" hidden></div>
+            <div class="modal-actions">
+              <button type="button" class="btn" id="btnCancelUser">Abbrechen</button>
+              <button type="submit" class="btn btn-primary">Speichern</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <div id="userDeleteModal" class="modal-overlay" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="userDeleteTitle">
+          <h2 id="userDeleteTitle">Nutzer löschen</h2>
+          <p class="extension-copy" id="userDeleteText"></p>
+          <div class="error-msg" id="userDeleteError" role="alert" hidden></div>
+          <div class="modal-actions">
+            <button type="button" class="btn" id="btnCancelUserDelete">Abbrechen</button>
+            <button type="button" class="btn btn-danger" id="btnConfirmUserDelete">Löschen</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    bindAdminEvents();
+    loadUsers();
+  }
+
+  function bindAdminEvents() {
+    document.getElementById('btnBackVault')?.addEventListener('click', () => renderVault());
+    bindHeader();
+    document.getElementById('btnNewUser').addEventListener('click', () => openUserModal());
+    document.getElementById('usersRegion').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-user-action]');
+      if (!btn) return;
+      const id = Number(btn.dataset.userId);
+      if (btn.dataset.userAction === 'edit') openUserModal(id);
+      if (btn.dataset.userAction === 'delete') openUserDeleteModal(id);
+    });
+    document.getElementById('btnCancelUser').addEventListener('click', closeUserModal);
+    document.getElementById('userModal').addEventListener('click', (e) => {
+      if (e.target.id === 'userModal') closeUserModal();
+    });
+    document.getElementById('userForm').addEventListener('submit', onUserSubmit);
+    document.getElementById('btnCancelUserDelete').addEventListener('click', closeUserDeleteModal);
+    document.getElementById('userDeleteModal').addEventListener('click', (e) => {
+      if (e.target.id === 'userDeleteModal') closeUserDeleteModal();
+    });
+    document.getElementById('btnConfirmUserDelete').addEventListener('click', onUserDeleteConfirm);
+  }
+
+  async function loadUsers() {
+    const errorEl = document.getElementById('adminError');
+    if (errorEl) { errorEl.hidden = true; errorEl.textContent = ''; }
+    try {
+      const { res, data } = await fetchJson('/api/users');
+      if (res.ok) {
+        state.users = Array.isArray(data) ? data : [];
+        renderUsers();
+      } else {
+        const msg = res.status === 403 ? 'Du hast keine Berechtigung, Nutzer zu laden.' : errorMessage(data, 'Nutzer konnten nicht geladen werden.');
+        if (errorEl) { errorEl.textContent = msg; errorEl.hidden = false; }
+        showToast(msg, true);
+      }
+    } catch (err) {
+      if (err.message === 'unauthorized') return;
+      const msg = 'Verbindungsfehler beim Laden der Nutzer.';
+      if (errorEl) { errorEl.textContent = msg; errorEl.hidden = false; }
+      showToast(msg, true);
+    }
+  }
+
+  function renderUsers() {
+    const region = document.getElementById('usersRegion');
+    if (!region) return;
+    if (!state.users.length) {
+      region.innerHTML = `<div class="admin-table-wrap"><div class="admin-empty"><h3>Noch keine Nutzer</h3><p>Mit „Neuer Nutzer" den ersten Zugang anlegen.</p></div></div>`;
+      return;
+    }
+
+    region.innerHTML = `
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Benutzername</th>
+              <th>E-Mail</th>
+              <th>Rolle</th>
+              <th>Scrum-Rolle</th>
+              <th>Erstellt</th>
+              <th>Aktionen</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${state.users.map(user => {
+              const isSelf = String(user.id) === String(state.currentUser?.id);
+              return `
+                <tr>
+                  <td><div class="admin-table-name">${escapeHtml(userDisplayName(user))}</div></td>
+                  <td class="mono">${escapeHtml(user.username)}</td>
+                  <td>${escapeHtml(user.email)}</td>
+                  <td><span class="role-pill">${escapeHtml(roleLabel(user.role))}</span></td>
+                  <td>${escapeHtml(scrumRoleLabel(user.scrum_role))}</td>
+                  <td>${escapeHtml(formatDate(user.created_at))}</td>
+                  <td>
+                    <div class="admin-actions">
+                      <button type="button" class="btn" data-user-action="edit" data-user-id="${user.id}">Bearbeiten</button>
+                      <button type="button" class="btn btn-danger" data-user-action="delete" data-user-id="${user.id}" ${isSelf ? 'disabled title="Eigenen Admin-Zugang nicht löschen"' : ''}>Löschen</button>
+                    </div>
+                  </td>
+                </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>`;
+  }
+
+  function openUserModal(userId = null) {
+    const form = document.getElementById('userForm');
+    form.reset();
+    state.editingUserId = userId;
+    document.getElementById('userEditId').value = userId || '';
+    document.getElementById('userFormError').hidden = true;
+    document.getElementById('userFormError').textContent = '';
+    const isEdit = userId !== null;
+    document.getElementById('userModalTitle').textContent = isEdit ? 'Nutzer bearbeiten' : 'Neuer Nutzer';
+    document.getElementById('userPwRequiredMark').hidden = isEdit;
+    document.getElementById('userPassword').required = !isEdit;
+    document.getElementById('userPwEditNote').hidden = !isEdit;
+
+    if (isEdit) {
+      const user = state.users.find(u => Number(u.id) === Number(userId));
+      if (!user) return;
+      document.getElementById('userFirstName').value = user.first_name || '';
+      document.getElementById('userLastName').value = user.last_name || '';
+      document.getElementById('userUsername').value = user.username || '';
+      document.getElementById('userEmail').value = user.email || '';
+      document.getElementById('userRole').value = user.role || 'member';
+      document.getElementById('userScrumRole').value = user.scrum_role || 'developer';
+    } else {
+      document.getElementById('userRole').value = 'member';
+      document.getElementById('userScrumRole').value = 'developer';
+    }
+
+    openDialog(document.getElementById('userModal'));
+  }
+
+  function closeUserModal() {
+    closeDialog(document.getElementById('userModal'));
+    document.getElementById('userForm').reset();
+    state.editingUserId = null;
+  }
+
+  async function onUserSubmit(e) {
+    e.preventDefault();
+    const editId = document.getElementById('userEditId').value;
+    const password = document.getElementById('userPassword').value;
+    const errorEl = document.getElementById('userFormError');
+    errorEl.hidden = true;
+    errorEl.textContent = '';
+
+    if (password && password.length < 6) {
+      errorEl.textContent = 'Das Passwort muss mindestens 6 Zeichen lang sein.';
+      errorEl.hidden = false;
+      return;
+    }
+    if (!editId && !password) {
+      errorEl.textContent = 'Für neue Nutzer ist ein Passwort erforderlich.';
+      errorEl.hidden = false;
+      return;
+    }
+
+    const payload = {
+      first_name: document.getElementById('userFirstName').value.trim(),
+      last_name: document.getElementById('userLastName').value.trim(),
+      role: document.getElementById('userRole').value,
+      scrum_role: document.getElementById('userScrumRole').value,
+    };
+
+    if (!payload.first_name || !payload.last_name) {
+      errorEl.textContent = 'Vorname und Nachname sind erforderlich.';
+      errorEl.hidden = false;
+      return;
+    }
+    if (!USER_ROLE_VALUES.has(payload.role) || !SCRUM_ROLE_VALUES.has(payload.scrum_role)) {
+      errorEl.textContent = 'Bitte gültige Rollen auswählen.';
+      errorEl.hidden = false;
+      return;
+    }
+
+    payload.username = document.getElementById('userUsername').value.trim();
+    payload.email = document.getElementById('userEmail').value.trim();
+    if (!payload.username || !payload.email) {
+      errorEl.textContent = 'Benutzername und E-Mail sind erforderlich.';
+      errorEl.hidden = false;
+      return;
+    }
+    if (!document.getElementById('userEmail').checkValidity()) {
+      errorEl.textContent = 'Bitte eine gültige E-Mail-Adresse eingeben.';
+      errorEl.hidden = false;
+      return;
+    }
+    if (password) payload.password = password;
+
+    try {
+      const { res, data } = await fetchJson(editId ? `/api/users/${editId}` : '/api/users', {
+        method: editId ? 'PUT' : 'POST',
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        closeUserModal();
+        await loadUsers();
+        showToast(editId ? 'Nutzer aktualisiert.' : 'Nutzer angelegt.');
+      } else {
+        const msg = res.status === 403 ? 'Du hast keine Berechtigung, Nutzer zu speichern.' : errorMessage(data, 'Nutzer konnte nicht gespeichert werden.');
+        errorEl.textContent = msg;
+        errorEl.hidden = false;
+      }
+    } catch (err) {
+      if (err.message === 'unauthorized') return;
+      errorEl.textContent = 'Verbindungsfehler beim Speichern des Nutzers.';
+      errorEl.hidden = false;
+    }
+  }
+
+  function openUserDeleteModal(userId) {
+    const user = state.users.find(u => Number(u.id) === Number(userId));
+    if (!user) return;
+    if (String(user.id) === String(state.currentUser?.id)) {
+      showToast('Du kannst deinen eigenen Admin-Zugang nicht löschen.', true);
+      return;
+    }
+    state.deletingUserId = userId;
+    document.getElementById('userDeleteText').textContent = `„${userDisplayName(user)}" wirklich löschen? Dieser Schritt kann nicht rückgängig gemacht werden.`;
+    document.getElementById('userDeleteError').hidden = true;
+    document.getElementById('userDeleteError').textContent = '';
+    openDialog(document.getElementById('userDeleteModal'));
+  }
+
+  function closeUserDeleteModal() {
+    closeDialog(document.getElementById('userDeleteModal'));
+    state.deletingUserId = null;
+  }
+
+  async function onUserDeleteConfirm() {
+    const id = state.deletingUserId;
+    const errorEl = document.getElementById('userDeleteError');
+    if (!id) return;
+    if (String(id) === String(state.currentUser?.id)) {
+      errorEl.textContent = 'Du kannst deinen eigenen Admin-Zugang nicht löschen.';
+      errorEl.hidden = false;
+      return;
+    }
+    try {
+      const { res, data } = await fetchJson(`/api/users/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        closeUserDeleteModal();
+        await loadUsers();
+        showToast('Nutzer gelöscht.');
+      } else {
+        errorEl.textContent = res.status === 403 ? 'Du hast keine Berechtigung, Nutzer zu löschen.' : errorMessage(data, 'Nutzer konnte nicht gelöscht werden.');
+        errorEl.hidden = false;
+      }
+    } catch (err) {
+      if (err.message === 'unauthorized') return;
+      errorEl.textContent = 'Verbindungsfehler beim Löschen des Nutzers.';
+      errorEl.hidden = false;
+    }
+  }
+
+  function bindVaultEvents() {
+    document.getElementById('searchInput').addEventListener('input', (e) => {
+      state.searchQuery = e.target.value.toLowerCase();
+      renderList();
+    });
+
+    bindHeader();
+
+    if (canManageUsers()) {
+      document.getElementById('btnUsers').addEventListener('click', () => renderAdmin());
+    }
+
+    document.getElementById('btnNew').addEventListener('click', () => openEntryModal());
+    document.getElementById('btnCancelEntry').addEventListener('click', () => closeEntryModal());
+    document.getElementById('entryModal').addEventListener('click', (e) => {
+      if (e.target.id === 'entryModal') closeEntryModal();
+    });
+    document.getElementById('entryForm').addEventListener('submit', onEntrySubmit);
+    // Wechselt der Tresor im Formular, passen die alten Ordner nicht mehr
+    document.getElementById('entryPrivate').addEventListener('change', () => populateFolderSelect(null));
+    document.getElementById('entryPassword').addEventListener('input', onEntryPasswordInput);
+    document.getElementById('btnToggleGenerator').innerHTML = ICONS.dice + ' Passwort generieren';
+    document.getElementById('genRoll').innerHTML = ICONS.dice + ' Neu würfeln';
+    document.getElementById('genCopyPreview').innerHTML = ICONS.copy;
+    document.getElementById('btnToggleGenerator').addEventListener('click', () => togglePasswordGeneratorPanel());
+    document.getElementById('genRoll').addEventListener('click', () => rollPasswordGenerator());
+    document.getElementById('genApply').addEventListener('click', () => applyGeneratedPassword());
+    document.getElementById('genCopyPreview').addEventListener('click', () => {
+      const value = document.getElementById('genPreview').value;
+      if (value) copyText(value, 'Generiertes Passwort', { sensitive: true });
+    });
+    document.getElementById('genLengthRange').addEventListener('input', () => {
+      document.getElementById('genLength').value = document.getElementById('genLengthRange').value;
+      rollPasswordGenerator();
+    });
+    ['genLength', 'genUpper', 'genLower', 'genDigits', 'genSymbols', 'genExcludeSimilar'].forEach((id) => {
+      document.getElementById(id).addEventListener('input', rollPasswordGenerator);
+    });
+    document.getElementById('totpEditNote').addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-totp-action]');
+      if (!btn) return;
+      state.clearTotpOnSave = btn.dataset.totpAction === 'clear';
+      updateTotpNoteUI();
+    });
+
+    document.getElementById('btnViewHistory').innerHTML = ICONS.history + ' Verlauf ansehen';
+    document.getElementById('btnViewHistory').addEventListener('click', () => {
+      const editId = document.getElementById('editId').value;
+      if (!editId) return;
+      closeEntryModal();
+      openHistoryModal(Number(editId));
+    });
+    document.getElementById('btnCloseHistory').addEventListener('click', () => closeHistoryModal());
+    document.getElementById('historyModal').addEventListener('click', (e) => {
+      if (e.target.id === 'historyModal') closeHistoryModal();
+    });
+    document.getElementById('historyList').addEventListener('click', onHistoryListClick);
+
+    document.getElementById('entryList').addEventListener('click', onListClick);
+    document.getElementById('entryList').addEventListener('contextmenu', onEntryContextMenu);
+    document.getElementById('entryList').addEventListener('dragstart', onEntryDragStart);
+    document.getElementById('entryList').addEventListener('dragend', onEntryDragEnd);
+    document.getElementById('entryContextMenu').addEventListener('click', onContextMenuItemClick);
+
+    document.getElementById('folderSidebar').addEventListener('click', onFolderTreeClick);
+    document.getElementById('folderSidebar').addEventListener('contextmenu', onFolderContextMenu);
+    document.getElementById('folderSidebar').addEventListener('dragover', onFolderDragOver);
+    document.getElementById('folderSidebar').addEventListener('dragenter', onFolderDragOver);
+    document.getElementById('folderSidebar').addEventListener('dragleave', onFolderDragLeave);
+    document.getElementById('folderSidebar').addEventListener('drop', onFolderDrop);
+    document.getElementById('folderDrawerPanel').addEventListener('click', onFolderTreeClick);
+    document.getElementById('folderDrawerPanel').addEventListener('contextmenu', onFolderContextMenu);
+    document.getElementById('folderDrawerPanel').addEventListener('dragover', onFolderDragOver);
+    document.getElementById('folderDrawerPanel').addEventListener('dragenter', onFolderDragOver);
+    document.getElementById('folderDrawerPanel').addEventListener('dragleave', onFolderDragLeave);
+    document.getElementById('folderDrawerPanel').addEventListener('drop', onFolderDrop);
+    document.getElementById('folderContextMenu').addEventListener('click', onFolderContextMenuItemClick);
+    document.getElementById('btnFolderDrawer').addEventListener('click', openFolderDrawer);
+    document.getElementById('folderDrawer').addEventListener('click', (e) => {
+      if (e.target.id === 'folderDrawer') closeFolderDrawer();
+    });
+    document.removeEventListener('keydown', onVaultKeydown);
+    document.addEventListener('keydown', onVaultKeydown);
+
+    document.getElementById('btnCancelFolder').addEventListener('click', () => closeFolderModal());
+    document.getElementById('folderModal').addEventListener('click', (e) => {
+      if (e.target.id === 'folderModal') closeFolderModal();
+    });
+    document.getElementById('folderForm').addEventListener('submit', onFolderSubmit);
+  }
+
+  function openFolderModal(parentId = null) {
+    state.folderModalMode = 'create';
+    state.pendingFolderParentId = parentId;
+    state.editingFolderId = null;
+    document.getElementById('folderModalTitle').textContent = 'Neuen Ordner anlegen';
+    document.getElementById('folderSubmitBtn').textContent = 'Anlegen';
+    document.getElementById('folderForm').reset();
+    openDialog(document.getElementById('folderModal'));
+  }
+
+  function openFolderRenameModal(id) {
+    const folder = state.folders.find(f => f.id === id);
+    if (!folder) return;
+    state.folderModalMode = 'rename';
+    state.pendingFolderParentId = null;
+    state.editingFolderId = id;
+    document.getElementById('folderModalTitle').textContent = 'Ordner umbenennen';
+    document.getElementById('folderSubmitBtn').textContent = 'Speichern';
+    document.getElementById('folderForm').reset();
+    document.getElementById('folderName').value = folder.name;
+    openDialog(document.getElementById('folderModal'));
+  }
+
+  function closeFolderModal() {
+    closeDialog(document.getElementById('folderModal'));
+    document.getElementById('folderForm').reset();
+    state.pendingFolderParentId = null;
+    state.editingFolderId = null;
+    state.folderModalMode = 'create';
+  }
+
+  /* ---------- Passwort-Generator (kryptografisch sicher, ausschließlich crypto.getRandomValues) ---------- */
+  const SYMBOL_CHARS = '!@#$%^&*()-_=+[]{}?';
+  const GEN_UPPER_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const GEN_LOWER_CHARS = 'abcdefghijklmnopqrstuvwxyz';
+  const GEN_DIGIT_CHARS = '0123456789';
+
+  function randomInt(maxExclusive) {
+    // Rejection-Sampling gegen Modulo-Bias: nur Bytes < 256 - (256 % maxExclusive) akzeptieren.
+    const limit = 256 - (256 % maxExclusive);
+    let byte;
+    do {
+      byte = crypto.getRandomValues(new Uint8Array(1))[0];
+    } while (byte >= limit);
+    return byte % maxExclusive;
+  }
+
+  function getGeneratorCategories({ useUpper, useLower, useDigits, useSymbols, excludeSimilar }) {
+    let upper = GEN_UPPER_CHARS;
+    let lower = GEN_LOWER_CHARS;
+    let digits = GEN_DIGIT_CHARS;
+    if (excludeSimilar) {
+      upper = upper.replace(/[IO]/g, '');
+      lower = lower.replace(/l/g, '');
+      digits = digits.replace(/[01]/g, '');
+    }
+    const categories = [];
+    if (useUpper) categories.push(upper);
+    if (useLower) categories.push(lower);
+    if (useDigits) categories.push(digits);
+    if (useSymbols) categories.push(SYMBOL_CHARS);
+    return categories;
+  }
+
+  function generatePassword({ length, useUpper, useLower, useDigits, useSymbols, excludeSimilar }) {
+    const categories = getGeneratorCategories({ useUpper, useLower, useDigits, useSymbols, excludeSimilar });
+    if (!categories.length) return null;
+    const pool = categories.join('');
+    const result = new Array(length);
+    // Garantiert mindestens 1 Zeichen aus jeder gewählten Kategorie.
+    categories.forEach((cat, i) => {
+      result[i] = cat[randomInt(cat.length)];
+    });
+    for (let i = categories.length; i < length; i++) {
+      result[i] = pool[randomInt(pool.length)];
+    }
+    // Fisher-Yates-Shuffle
+    for (let i = result.length - 1; i > 0; i--) {
+      const j = randomInt(i + 1);
+      [result[i], result[j]] = [result[j], result[i]];
+    }
+    return result.join('');
+  }
+
+  function readGeneratorOptions() {
+    return {
+      length: Math.min(64, Math.max(8, Number(document.getElementById('genLength').value) || 20)),
+      useUpper: document.getElementById('genUpper').checked,
+      useLower: document.getElementById('genLower').checked,
+      useDigits: document.getElementById('genDigits').checked,
+      useSymbols: document.getElementById('genSymbols').checked,
+      excludeSimilar: document.getElementById('genExcludeSimilar').checked,
+    };
+  }
+
+  function setGeneratorEntropyStrength(bits) {
+    const el = document.getElementById('genEntropy');
+    el.classList.remove('generator-entropy--weak', 'generator-entropy--strong');
+    if (bits < 60) el.classList.add('generator-entropy--weak');
+    else if (bits > 100) el.classList.add('generator-entropy--strong');
+  }
+
+  function updateGeneratorAvailability(options) {
+    const hasCharset = options.useUpper || options.useLower || options.useDigits || options.useSymbols;
+    document.getElementById('genRoll').disabled = !hasCharset;
+    document.getElementById('genApply').disabled = !hasCharset;
+    document.getElementById('genNoCharsetNote').hidden = hasCharset;
+    if (!hasCharset) {
+      document.getElementById('genPreview').value = '';
+      document.getElementById('genEntropy').textContent = '';
+      setGeneratorEntropyStrength(0);
+    }
+    return hasCharset;
+  }
+
+  function rollPasswordGenerator() {
+    const options = readGeneratorOptions();
+    document.getElementById('genLengthRange').value = options.length;
+    document.getElementById('genLengthValue').textContent = `${options.length} Zeichen`;
+    if (!updateGeneratorAvailability(options)) return;
+    const password = generatePassword(options);
+    const poolSize = getGeneratorCategories(options).join('').length;
+    const bits = Math.round(options.length * Math.log2(poolSize));
+    document.getElementById('genPreview').value = password;
+    document.getElementById('genEntropy').textContent = `≈${bits} Bit Entropie`;
+    setGeneratorEntropyStrength(bits);
+  }
+
+  function togglePasswordGeneratorPanel() {
+    const panel = document.getElementById('pwGeneratorPanel');
+    panel.hidden = !panel.hidden;
+    document.getElementById('btnToggleGenerator').setAttribute('aria-expanded', String(!panel.hidden));
+    if (!panel.hidden) rollPasswordGenerator();
+  }
+
+  function applyGeneratedPassword() {
+    const preview = document.getElementById('genPreview').value;
+    if (!preview) return;
+    const entryPasswordEl = document.getElementById('entryPassword');
+    entryPasswordEl.value = preview;
+    onEntryPasswordInput({ target: entryPasswordEl });
+    document.getElementById('pwGeneratorPanel').hidden = true;
+    document.getElementById('btnToggleGenerator').setAttribute('aria-expanded', 'false');
+  }
+
+  function resetPasswordGenerator() {
+    document.getElementById('pwGeneratorPanel').hidden = true;
+    document.getElementById('btnToggleGenerator').setAttribute('aria-expanded', 'false');
+    document.getElementById('genLength').value = 20;
+    document.getElementById('genLengthRange').value = 20;
+    document.getElementById('genLengthValue').textContent = '20 Zeichen';
+    document.getElementById('genUpper').checked = true;
+    document.getElementById('genLower').checked = true;
+    document.getElementById('genDigits').checked = true;
+    document.getElementById('genSymbols').checked = true;
+    document.getElementById('genExcludeSimilar').checked = false;
+    document.getElementById('genPreview').value = '';
+    document.getElementById('genEntropy').textContent = '';
+    setGeneratorEntropyStrength(0);
+    document.getElementById('genNoCharsetNote').hidden = true;
+    document.getElementById('genRoll').disabled = false;
+    document.getElementById('genApply').disabled = false;
+  }
+
+  function onEntryPasswordInput(e) {
+    const note = document.getElementById('pwDuplicateNote');
+    const value = e.target.value;
+    if (!value) { note.hidden = true; note.textContent = ''; return; }
+    const editId = document.getElementById('editId').value;
+    const editIdNum = editId ? Number(editId) : null;
+    const match = state.passwords.find(p => p.password === value && p.id !== editIdNum);
+    if (match) {
+      note.textContent = `Dieses Passwort wird bereits bei „${match.name}" verwendet.`;
+      note.hidden = false;
+    } else {
+      note.hidden = true;
+      note.textContent = '';
+    }
+  }
+
+  function updateTotpNoteUI() {
+    const note = document.getElementById('totpEditNote');
+    const editId = document.getElementById('editId').value;
+    const pw = editId ? state.passwords.find(p => p.id === Number(editId)) : null;
+
+    if (!pw || !pw.totp_secret) {
+      note.hidden = true;
+      note.innerHTML = '';
+      return;
+    }
+
+    note.hidden = false;
+    note.innerHTML = state.clearTotpOnSave
+      ? `2FA wird beim Speichern entfernt. <button type="button" class="link-btn" data-totp-action="undo">Rückgängig</button>`
+      : `Leer lassen, um das gespeicherte TOTP-Secret unverändert zu lassen. <button type="button" class="link-btn" data-totp-action="clear">2FA entfernen</button>`;
+  }
+
+  function openEntryModal(id = null) {
+    const overlay = document.getElementById('entryModal');
+    const form = document.getElementById('entryForm');
+    form.reset();
+    resetPasswordGenerator();
+    document.getElementById('editId').value = '';
+    document.getElementById('pwEditNote').hidden = true;
+    document.getElementById('pwDuplicateNote').hidden = true;
+    document.getElementById('pwDuplicateNote').textContent = '';
+    document.getElementById('pwRequiredMark').hidden = false;
+    document.getElementById('entryPassword').required = true;
+    document.getElementById('entryTotpSecret').value = '';
+    state.clearTotpOnSave = false;
+    const editing = id ? state.passwords.find(p => p.id === id) : null;
+    document.getElementById('entryPrivateField').hidden = !hasPrivateVaultFeature();
+    document.getElementById('entryPrivate').checked = editing ? Boolean(editing.private) : state.vaultMode === 'private';
+    const defaultFolderId = isRealFolderKey(state.activeFolder) ? Number(state.activeFolder) : null;
+    populateFolderSelect(defaultFolderId);
+
+    if (id) {
+      const pw = state.passwords.find(p => p.id === id);
+      if (!pw) return;
+      document.getElementById('entryModalTitle').textContent = 'Eintrag bearbeiten';
+      document.getElementById('editId').value = pw.id;
+      document.getElementById('entryName').value = pw.name;
+      document.getElementById('entryUrl').value = pw.url || '';
+      document.getElementById('entryUsername').value = pw.username;
+      document.getElementById('entryPassword').value = '';
+      document.getElementById('entryNotes').value = pw.notes || '';
+      populateFolderSelect(pw.folder_id);
+      document.getElementById('pwEditNote').hidden = false;
+      document.getElementById('pwRequiredMark').hidden = true;
+      document.getElementById('entryPassword').required = false;
+    } else {
+      document.getElementById('entryModalTitle').textContent = 'Neuer Eintrag';
+    }
+    updateTotpNoteUI();
+    openDialog(overlay);
+  }
+
+  function closeEntryModal() {
+    closeDialog(document.getElementById('entryModal'));
+    document.getElementById('entryForm').reset();
+    resetPasswordGenerator();
+    document.getElementById('pwDuplicateNote').hidden = true;
+    document.getElementById('pwDuplicateNote').textContent = '';
+    state.clearTotpOnSave = false;
+    document.getElementById('totpEditNote').hidden = true;
+    document.getElementById('totpEditNote').innerHTML = '';
+  }
+
+  async function onEntrySubmit(e) {
+    e.preventDefault();
+    const editId = document.getElementById('editId').value;
+    const folderValue = document.getElementById('entryFolder').value;
+    const payload = {
+      name: document.getElementById('entryName').value.trim(),
+      url: document.getElementById('entryUrl').value.trim(),
+      username: document.getElementById('entryUsername').value.trim(),
+      password: document.getElementById('entryPassword').value,
+      notes: document.getElementById('entryNotes').value.trim(),
+      folder_id: folderValue ? Number(folderValue) : null,
+    };
+    const before = editId ? state.passwords.find(p => p.id === Number(editId)) : null;
+    if (hasPrivateVaultFeature()) payload.private = document.getElementById('entryPrivate').checked;
+    if (editId && payload.password === '') {
+      delete payload.password;
+    }
+
+    const totpValue = document.getElementById('entryTotpSecret').value.trim();
+    if (state.clearTotpOnSave) {
+      payload.totp_secret = null;
+    } else if (totpValue) {
+      payload.totp_secret = totpValue;
+    }
+
+    try {
+      const url = editId ? `/api/passwords/${editId}` : '/api/passwords';
+      const method = editId ? 'PUT' : 'POST';
+      const res = await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.token}` },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (res.ok) {
+        closeEntryModal();
+        await loadVaultData();
+        const moved = before && 'private' in payload && Boolean(before.private) !== payload.private;
+        showToast(moved
+          ? (payload.private ? 'Eintrag in den privaten Tresor verschoben.' : 'Eintrag in den gemeinsamen Tresor verschoben.')
+          : (editId ? 'Eintrag aktualisiert.' : (payload.private ? 'Eintrag im privaten Tresor gespeichert.' : 'Eintrag gespeichert.')));
+      } else {
+        showToast(data.error || 'Eintrag konnte nicht gespeichert werden.', true);
+      }
+    } catch {
+      showToast('Verbindungsfehler beim Speichern.', true);
+    }
+  }
+
+  /* ---------- Passwortverlauf ---------- */
+  let historyModalState = { entryId: null, items: [], shown: new Set() };
+
+  function renderHistoryList() {
+    const list = document.getElementById('historyList');
+    const emptyNote = document.getElementById('historyEmptyNote');
+    const items = historyModalState.items;
+
+    if (!items.length) {
+      list.innerHTML = '';
+      emptyNote.hidden = false;
+      return;
+    }
+
+    emptyNote.hidden = true;
+    list.innerHTML = items.map(item => {
+      const isShown = historyModalState.shown.has(String(item.id));
+      const text = isShown ? item.password : maskOf(item.password);
+      const label = isShown ? 'Passwort verbergen' : 'Passwort anzeigen';
+      const metaText = item.is_current
+        ? `<span class="history-badge">Aktuell</span> · ${formatDate(item.changed_at)} · ${escapeHtml(item.changed_by_username || 'Unbekannt')}`
+        : `${formatDate(item.changed_at)} · ${escapeHtml(item.changed_by_username || 'Unbekannt')}`;
+      return `
+      <li class="history-row${item.is_current ? ' is-current' : ''}" data-history-id="${item.id}">
+        <div class="history-row-main">
+          <span class="mono">${escapeHtml(text)}</span>
+          <span class="history-meta">${metaText}</span>
+        </div>
+        <div class="history-actions">
+          <button type="button" class="btn btn-icon" data-history-action="toggle" aria-label="${label}" title="${label}">${isShown ? ICONS.eyeOff : ICONS.eye}</button>
+          <button type="button" class="btn btn-icon" data-history-action="copy" aria-label="Passwort kopieren" title="Passwort kopieren">${ICONS.copy}</button>
+        </div>
+      </li>`;
+    }).join('');
+  }
+
+  async function openHistoryModal(entryId) {
+    historyModalState = { entryId, items: [], shown: new Set() };
+    renderHistoryList();
+    openDialog(document.getElementById('historyModal'));
+    try {
+      const { res, data } = await fetchJson(`/api/passwords/${entryId}/history`);
+      if (res.ok) {
+        historyModalState.items = data;
+        renderHistoryList();
+      } else {
+        showToast(errorMessage(data, 'Verlauf konnte nicht geladen werden.'), true);
+      }
+    } catch {
+      showToast('Verbindungsfehler beim Laden des Verlaufs.', true);
+    }
+  }
+
+  function closeHistoryModal() {
+    closeDialog(document.getElementById('historyModal'));
+    historyModalState = { entryId: null, items: [], shown: new Set() };
+  }
+
+  function onHistoryListClick(e) {
+    const btn = e.target.closest('button[data-history-action]');
+    if (!btn) return;
+    const row = e.target.closest('li[data-history-id]');
+    const id = row.dataset.historyId;
+    const item = historyModalState.items.find(h => String(h.id) === id);
+    if (!item) return;
+
+    if (btn.dataset.historyAction === 'toggle') {
+      if (historyModalState.shown.has(id)) historyModalState.shown.delete(id);
+      else historyModalState.shown.add(id);
+      renderHistoryList();
+    } else if (btn.dataset.historyAction === 'copy') {
+      copyText(item.password, 'Passwort', { sensitive: true });
+    }
+  }
+
+  function togglePasswordReveal(row, pw) {
+    const span = row.querySelector('.pw-chars');
+    const btn = row.querySelector('[data-action="toggle"]');
+    const willShow = !state.shown[pw.id];
+
+    const applyText = () => {
+      state.shown[pw.id] = willShow;
+      span.textContent = willShow ? pw.password : maskOf(pw.password);
+      const label = willShow ? 'Passwort verbergen' : 'Passwort anzeigen';
+      btn.setAttribute('aria-label', label);
+      btn.title = label;
+      btn.innerHTML = willShow ? ICONS.eyeOff : ICONS.eye;
+    };
+
+    if (reducedMotion) { applyText(); return; }
+
+    span.classList.add('pw-fade');
+    window.setTimeout(() => {
+      applyText();
+      requestAnimationFrame(() => span.classList.remove('pw-fade'));
+    }, 110);
+  }
+
+  /* Zentrale Aktionslogik pro Eintrag — wird sowohl von den Zeilen-Buttons
+     als auch vom Rechtsklick-Kontextmenü aufgerufen, damit es keine zweite
+     Kopie der Kopier-/Bearbeiten-/Lösch-Logik gibt. */
+  async function performRowAction(action, id) {
+    const row = document.querySelector(`li.entry-row[data-id="${id}"]`);
+    const pw = state.passwords.find(p => p.id === id);
+    if (!pw) return;
+
+    if (action === 'toggle') {
+      if (row) togglePasswordReveal(row, pw);
+    } else if (action === 'copy-username') {
+      await copyText(pw.username, 'Benutzername');
+    } else if (action === 'copy-password') {
+      await copyText(pw.password, 'Passwort', { sensitive: true });
+    } else if (action === 'copy-totp') {
+      if (pw.totp_secret) {
+        const code = await totpCode(pw.totp_secret);
+        await copyText(code, 'TOTP-Code', { sensitive: true });
+      }
+    } else if (action === 'edit') {
+      openEntryModal(id);
+    } else if (action === 'history') {
+      openHistoryModal(id);
+    } else if (action === 'move-vault') {
+      await moveEntryBetweenVaults(pw);
+    } else if (action === 'delete') {
+      if (confirm(`„${pw.name}" endgültig löschen?`)) {
+        try {
+          const res = await fetch(`/api/passwords/${id}`, {
+            method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${state.token}` }
+          });
+          if (res.ok) {
+            await loadVaultData();
+            showToast('Eintrag gelöscht.');
+          } else {
+            showToast('Eintrag konnte nicht gelöscht werden.', true);
+          }
+        } catch {
+          showToast('Verbindungsfehler beim Löschen.', true);
+        }
+      }
+    }
+  }
+
+  async function onListClick(e) {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const row = e.target.closest('li.entry-row');
+    const id = Number(row.dataset.id);
+    await performRowAction(btn.dataset.action, id);
+  }
+
+  /* ---------- Row context menu ---------- */
+  let contextMenuState = { id: null };
+
+  function getContextMenuItems(id) {
+    const pw = state.passwords.find(p => p.id === id);
+    if (!pw) return [];
+    const shown = !!state.shown[id];
+    return [
+      {
+        action: 'toggle',
+        label: shown ? 'Passwort verbergen' : 'Passwort anzeigen',
+        desc: shown ? 'Blendet das Passwort wieder aus.' : 'Blendet das gespeicherte Passwort ein.',
+        icon: shown ? ICONS.eyeOff : ICONS.eye,
+      },
+      { action: 'copy-username', label: 'Benutzername kopieren', desc: 'Legt den Benutzernamen in die Zwischenablage.', icon: ICONS.copy },
+      { action: 'copy-password', label: 'Passwort kopieren', desc: 'Legt das Passwort in die Zwischenablage.', icon: ICONS.copy },
+      ...(pw.totp_secret ? [{ action: 'copy-totp', label: 'TOTP-Code kopieren', desc: 'Legt den aktuellen TOTP-Code in die Zwischenablage.', icon: ICONS.totp }] : []),
+      { action: 'edit', label: 'Bearbeiten', desc: 'Öffnet den Eintrag zum Ändern.', icon: ICONS.edit },
+      ...(hasPrivateVaultFeature() ? [pw.private
+        ? { action: 'move-vault', label: 'In gemeinsamen Tresor verschieben', desc: 'Danach sehen alle Mitglieder den Eintrag.', icon: LOCK_OPEN_ICON }
+        : { action: 'move-vault', label: 'In privaten Tresor verschieben', desc: 'Danach siehst nur du den Eintrag.', icon: LOCK_ICON }] : []),
+      { action: 'history', label: 'Passwortverlauf', desc: 'Zeigt frühere Passwörter dieses Eintrags.', icon: ICONS.history },
+      { action: 'delete', label: 'Löschen', desc: 'Entfernt den Eintrag endgültig.', icon: ICONS.trash, danger: true },
+    ];
+  }
+
+  function closeContextMenu() {
+    const menu = document.getElementById('entryContextMenu');
+    if (!menu || menu.hidden) return;
+    menu.hidden = true;
+    menu.innerHTML = '';
+    document.removeEventListener('mousedown', onContextMenuOutsideClick, true);
+    document.removeEventListener('keydown', onContextMenuKeydown, true);
+    window.removeEventListener('scroll', closeContextMenu, true);
+    contextMenuState = { id: null };
+  }
+
+  function onContextMenuOutsideClick(e) {
+    const menu = document.getElementById('entryContextMenu');
+    if (menu && !menu.contains(e.target)) closeContextMenu();
+  }
+
+  function onContextMenuKeydown(e) {
+    const menu = document.getElementById('entryContextMenu');
+    if (!menu || menu.hidden) return;
+    const items = Array.from(menu.querySelectorAll('[role="menuitem"]'));
+    if (!items.length) return;
+    const currentIndex = items.indexOf(document.activeElement);
+
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeContextMenu();
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      items[(currentIndex + 1 + items.length) % items.length].focus();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      items[(currentIndex - 1 + items.length) % items.length].focus();
+    } else if (e.key === 'Home') {
+      e.preventDefault();
+      items[0].focus();
+    } else if (e.key === 'End') {
+      e.preventDefault();
+      items[items.length - 1].focus();
+    }
+  }
+
+  function openContextMenu(id, x, y) {
+    closeContextMenu();
+    const items = getContextMenuItems(id);
+    if (!items.length) return;
+    const menu = document.getElementById('entryContextMenu');
+    contextMenuState = { id };
+
+    menu.innerHTML = items.map(item => `
+      <button type="button" class="context-menu-item${item.danger ? ' context-menu-item-danger' : ''}" role="menuitem" data-action="${item.action}">
+        <span class="context-menu-icon">${item.icon}</span>
+        <span class="context-menu-text">
+          <span class="context-menu-label">${escapeHtml(item.label)}</span>
+          <span class="context-menu-desc">${escapeHtml(item.desc)}</span>
+        </span>
+      </button>
+    `).join('');
+
+    menu.hidden = false;
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+
+    // Innerhalb des sichtbaren Viewports halten, nötigenfalls nach links/oben klappen.
+    const rect = menu.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    let left = x, top = y;
+    if (rect.right > vw - 8) left = Math.max(8, x - rect.width);
+    if (rect.bottom > vh - 8) top = Math.max(8, y - rect.height);
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+
+    document.addEventListener('mousedown', onContextMenuOutsideClick, true);
+    document.addEventListener('keydown', onContextMenuKeydown, true);
+    window.addEventListener('scroll', closeContextMenu, true);
+
+    const first = menu.querySelector('[role="menuitem"]');
+    if (first) first.focus();
+  }
+
+  function onEntryContextMenu(e) {
+    const row = e.target.closest('li.entry-row');
+    if (!row) return;
+    e.preventDefault();
+    openContextMenu(Number(row.dataset.id), e.clientX, e.clientY);
+  }
+
+  async function onContextMenuItemClick(e) {
+    const btn = e.target.closest('[role="menuitem"]');
+    if (!btn) return;
+    const id = contextMenuState.id;
+    const action = btn.dataset.action;
+    closeContextMenu();
+    await performRowAction(action, id);
+  }
+
+  async function copyText(text, label, { sensitive = false } = {}) {
+    try {
+      await navigator.clipboard.writeText(text);
+      let message = `${label} kopiert.`;
+      if (sensitive) {
+        if (clipboardClearTimer) clearTimeout(clipboardClearTimer);
+        const copiedValue = text;
+        clipboardClearTimer = setTimeout(() => {
+          navigator.clipboard.readText()
+            .then(current => {
+              if (current === copiedValue) {
+                navigator.clipboard.writeText('').catch(() => {});
+              }
+            })
+            .catch(() => {
+              navigator.clipboard.writeText('').catch(() => {});
+            });
+        }, CLIPBOARD_CLEAR_MS);
+        message += ' Zwischenablage wird nach 25 Sekunden geleert.';
+      }
+      showToast(message);
+    } catch {
+      showToast(`${label} konnte nicht kopiert werden.`, true);
+    }
+  }
+
+  /* ---------- Gemeinsamer und privater Tresor ---------- */
+  // state.allPasswords/allFolders enthalten alles, was der Server diesem Benutzer zeigt.
+  // state.passwords/folders sind die aktuelle Ansicht – damit funktionieren Ordner, Suche,
+  // Verschieben und Verlauf für beide Tresore ohne weitere Änderungen.
+  const VAULT_MODE_KEY = 'vaultMode';
+  function hasPrivateVaultFeature() {
+    return Boolean(state.currentUser?.private_vault);
+  }
+  function readVaultMode() {
+    try { return localStorage.getItem(VAULT_MODE_KEY) === 'private' ? 'private' : 'shared'; } catch { return 'shared'; }
+  }
+  state.vaultMode = readVaultMode();
+
+  function applyVaultMode() {
+    if (!hasPrivateVaultFeature()) state.vaultMode = 'shared';
+    const wantPrivate = state.vaultMode === 'private';
+    state.passwords = (state.allPasswords || []).filter(p => Boolean(p.private) === wantPrivate);
+    state.folders = (state.allFolders || []).filter(f => Boolean(f.private) === wantPrivate);
+    const title = document.getElementById('vaultMainTitle');
+    if (title) title.textContent = wantPrivate ? 'Privater Tresor' : 'Credential-Konsole';
+    const note = document.getElementById('vaultModeNote');
+    if (note) note.hidden = !wantPrivate;
+    document.querySelector('.vault-main')?.classList.toggle('is-private', wantPrivate);
+  }
+
+  function setVaultMode(mode) {
+    state.vaultMode = mode === 'private' && hasPrivateVaultFeature() ? 'private' : 'shared';
+    try { localStorage.setItem(VAULT_MODE_KEY, state.vaultMode); } catch {}
+    state.activeFolder = 'all';
+    state.searchQuery = '';
+    const input = document.getElementById('searchInput');
+    if (input) input.value = '';
+    applyVaultMode();
+    setDefaultExpandedFolders();
+    renderFolderTree();
+    renderList();
+  }
+
+  function vaultModeSwitchHTML() {
+    if (!hasPrivateVaultFeature()) return '';
+    const all = state.allPasswords || [];
+    const button = (mode, label, count) => `
+      <button type="button" class="vault-mode-btn${state.vaultMode === mode ? ' is-active' : ''}" data-vault-mode="${mode}" aria-pressed="${state.vaultMode === mode}">
+        ${label}<span class="vault-mode-count">${count}</span>
+      </button>`;
+    return `<div class="vault-mode" role="group" aria-label="Tresor wählen">
+      ${button('shared', 'Gemeinsam', all.filter(p => !p.private).length)}
+      ${button('private', `${LOCK_ICON} Privat`, all.filter(p => p.private).length)}
+    </div>`;
+  }
+
+  async function moveEntryBetweenVaults(pw) {
+    const toPrivate = !pw.private;
+    if (!toPrivate && !confirm(`„${pw.name}" in den gemeinsamen Tresor verschieben? Danach sehen alle Mitglieder den Eintrag.`)) return;
+    try {
+      const res = await fetch(`/api/passwords/${pw.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.token}` },
+        body: JSON.stringify({ name: pw.name, username: pw.username, url: pw.url || '', notes: pw.notes || '', private: toPrivate })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { showToast(data.error || 'Eintrag konnte nicht verschoben werden.', true); return; }
+      await loadVaultData();
+      showToast(toPrivate ? `„${pw.name}" ist jetzt im privaten Tresor.` : `„${pw.name}" ist jetzt im gemeinsamen Tresor.`);
+    } catch {
+      showToast('Verbindungsfehler beim Verschieben.', true);
+    }
+  }
+
+  async function loadVaultData() {
+    try {
+      const [pwRes, folderRes] = await Promise.all([
+        fetch('/api/passwords', { headers: { 'Authorization': `Bearer ${state.token}` } }),
+        fetch('/api/passwords/folders', { headers: { 'Authorization': `Bearer ${state.token}` } }),
+      ]);
+      if (pwRes.status === 401 || folderRes.status === 401) { handleUnauthorized(); return; }
+      state.allPasswords = await pwRes.json();
+      state.allFolders = await folderRes.json();
+      applyVaultMode();
+      setDefaultExpandedFolders();
+      if (isRealFolderKey(state.activeFolder) === false && state.activeFolder !== 'all' && state.activeFolder !== 'none') state.activeFolder = 'all';
+      if (state.activeFolder === 'none' && !(state.folders.length > 0 && state.passwords.some(p => !p.folder_id))) state.activeFolder = 'all';
+      renderFolderTree();
+      renderList();
+      const entryParam = new URLSearchParams(window.location.search).get('entry');
+      if (entryParam) {
+        revealVaultEntry(entryParam);
+        history.replaceState(null, '', '/');
+      }
+    } catch {
+      showToast('Einträge konnten nicht geladen werden.', true);
+    }
+  }
+
+  /* ---------- Folder tree ---------- */
+  function isRealFolderKey(key) {
+    return key !== 'all' && key !== 'none' && state.folders.some(f => String(f.id) === String(key));
+  }
+
+  function getActiveFolderLabel() {
+    if (state.activeFolder === 'all') return 'Ordner';
+    if (state.activeFolder === 'none') return 'Ordner: Ohne Ordner';
+    const folder = state.folders.find(f => String(f.id) === state.activeFolder);
+    return folder ? `Ordner: ${folder.name}` : 'Ordner';
+  }
+
+  function buildFolderTree(folders = state.folders) {
+    const byParent = new Map();
+    folders.forEach(folder => {
+      const key = folder.parent_id == null ? 'root' : String(folder.parent_id);
+      if (!byParent.has(key)) byParent.set(key, []);
+      byParent.get(key).push(folder);
+    });
+    const attach = (parentKey) => (byParent.get(parentKey) || [])
+      .sort((a, b) => a.name.localeCompare(b.name, 'de'))
+      .map(folder => ({ ...folder, children: attach(String(folder.id)) }));
+    return attach('root');
+  }
+
+  function countDescendants(folderId) {
+    const children = state.folders.filter(f => String(f.parent_id) === String(folderId));
+    return children.reduce((sum, child) => sum + 1 + countDescendants(child.id), 0);
+  }
+
+  function setDefaultExpandedFolders() {
+    const currentIds = new Set(state.folders.map(f => String(f.id)));
+    for (const id of Array.from(state.expandedFolders)) {
+      if (!currentIds.has(id)) state.expandedFolders.delete(id);
+    }
+    const parents = new Set(state.folders.filter(f => f.parent_id != null).map(f => String(f.parent_id)));
+    parents.forEach(id => {
+      if (!state.expandedFolders.has(id)) state.expandedFolders.add(id);
+    });
+  }
+
+  function folderRowHTML({ key, label, count, level = 0, active = false, realFolder = false, hasChildren = false, expanded = false, folderId = null }) {
+    const dropAttrs = key === 'none' || realFolder ? ` data-drop-folder="${key === 'none' ? 'none' : folderId}"` : '';
+    return `
+      <div class="folder-row-wrap${level > 0 ? ' is-nested' : ''}" style="--level:${level}">
+        <div class="folder-row${active ? ' is-active' : ''}" role="button" tabindex="0" data-folder-key="${key}"${dropAttrs} aria-current="${active ? 'true' : 'false'}">
+          ${realFolder && hasChildren ? `<span class="folder-row-chevron${expanded ? ' is-open' : ''}" data-toggle-folder="${folderId}" aria-hidden="true">${ICONS.chevron}</span>` : `<span class="folder-row-chevron is-spacer" aria-hidden="true">${ICONS.chevron}</span>`}
+          <span class="folder-row-name">${escapeHtml(label)}</span>
+          <span class="folder-row-count">${count}</span>
+          ${realFolder ? `<button type="button" class="folder-row-menu-btn" data-folder-menu="${folderId}" aria-label="Ordner-Menü für „${escapeHtml(label)}“" title="Ordner-Menü">${ICONS.folderMenu}</button>` : '<span aria-hidden="true"></span>'}
+        </div>
+      </div>`;
+  }
+
+  function folderNodeHTML(node, level = 0) {
+    const id = String(node.id);
+    const hasChildren = node.children.length > 0;
+    const expanded = state.expandedFolders.has(id);
+    return `
+      <li>
+        ${folderRowHTML({
+          key: id,
+          label: node.name,
+          count: node.entry_count || 0,
+          level,
+          active: state.activeFolder === id,
+          realFolder: true,
+          hasChildren,
+          expanded,
+          folderId: node.id,
+        })}
+        ${hasChildren ? `<ul class="folder-children" ${expanded ? '' : 'hidden'}>${node.children.map(child => folderNodeHTML(child, level + 1)).join('')}</ul>` : ''}
+      </li>`;
+  }
+
+  function renderFolderTree() {
+    const totalCount = state.passwords.length;
+    const hasFolders = state.folders.length > 0;
+    const noFolderCount = state.passwords.filter(p => !p.folder_id).length;
+    const showNoFolder = hasFolders && noFolderCount > 0;
+    const tree = buildFolderTree();
+
+    const html = `
+      ${vaultModeSwitchHTML()}
+      <div class="folder-sidebar-head">
+        <h2 class="folder-sidebar-title">Ordner</h2>
+        <button type="button" class="btn" data-folder-create>Neuer Ordner</button>
+      </div>
+      <div class="folder-tree-section">
+        ${folderRowHTML({ key: 'all', label: 'Alle', count: totalCount, active: state.activeFolder === 'all' })}
+        ${showNoFolder ? folderRowHTML({ key: 'none', label: 'Ohne Ordner', count: noFolderCount, active: state.activeFolder === 'none' }) : ''}
+      </div>
+      <div class="folder-tree-section">
+        <ul class="folder-tree-list">${tree.map(node => folderNodeHTML(node)).join('')}</ul>
+      </div>`;
+
+    const sidebar = document.getElementById('folderSidebar');
+    const drawer = document.getElementById('folderDrawerPanel');
+    if (sidebar) sidebar.innerHTML = html;
+    if (drawer) drawer.innerHTML = html;
+    const trigger = document.getElementById('btnFolderDrawer');
+    if (trigger) trigger.textContent = getActiveFolderLabel();
+  }
+
+  function selectFolder(key) {
+    state.activeFolder = key;
+    renderFolderTree();
+    renderList();
+    closeFolderDrawer();
+  }
+
+  function openFolderDrawer() {
+    const drawer = document.getElementById('folderDrawer');
+    if (!drawer) return;
+    drawer.hidden = false;
+    const first = drawer.querySelector('[data-folder-key]');
+    if (first) first.focus();
+  }
+
+  function closeFolderDrawer() {
+    const drawer = document.getElementById('folderDrawer');
+    if (drawer) drawer.hidden = true;
+  }
+
+  function onVaultKeydown(e) {
+    const drawer = document.getElementById('folderDrawer');
+    if (e.key === 'Escape') {
+      closeFolderDrawer();
+      closeFolderContextMenu();
+      return;
+    }
+    const folderRow = e.target.closest?.('.folder-row[role="button"]');
+    if (folderRow && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      folderRow.click();
+    }
+  }
+
+  function onFolderContextMenu(e) {
+    const row = e.target.closest?.('.folder-row[data-folder-key]');
+    if (!row || !e.currentTarget.contains(row) || !isRealFolderKey(row.dataset.folderKey)) return;
+    e.preventDefault();
+    openFolderContextMenu(Number(row.dataset.folderKey), e.clientX, e.clientY);
+  }
+
+  function onFolderTreeClick(e) {
+    const modeBtn = e.target.closest('[data-vault-mode]');
+    if (modeBtn) {
+      setVaultMode(modeBtn.dataset.vaultMode);
+      return;
+    }
+    const createBtn = e.target.closest('[data-folder-create]');
+    if (createBtn) {
+      openFolderModal(isRealFolderKey(state.activeFolder) ? Number(state.activeFolder) : null);
+      return;
+    }
+
+    const menuBtn = e.target.closest('[data-folder-menu]');
+    if (menuBtn) {
+      e.stopPropagation();
+      const rect = menuBtn.getBoundingClientRect();
+      openFolderContextMenu(Number(menuBtn.dataset.folderMenu), rect.left, rect.bottom + 6);
+      return;
+    }
+
+    const chevron = e.target.closest('[data-toggle-folder]');
+    if (chevron) {
+      e.stopPropagation();
+      const id = String(chevron.dataset.toggleFolder);
+      if (state.expandedFolders.has(id)) state.expandedFolders.delete(id);
+      else state.expandedFolders.add(id);
+      renderFolderTree();
+      return;
+    }
+
+    const row = e.target.closest('[data-folder-key]');
+    if (row) selectFolder(row.dataset.folderKey);
+  }
+
+  let folderContextMenuState = { id: null };
+
+  function openFolderContextMenu(id, x, y) {
+    closeFolderContextMenu();
+    const folder = state.folders.find(f => f.id === id);
+    if (!folder) return;
+    const descendants = countDescendants(id);
+    const descendantText = descendants ? ` und ${descendants} Unterordner` : '';
+    const menu = document.getElementById('folderContextMenu');
+    folderContextMenuState = { id };
+    menu.innerHTML = `
+      <button type="button" class="context-menu-item" role="menuitem" data-folder-action="create-child">
+        <span class="context-menu-icon">${ICONS.edit}</span>
+        <span class="context-menu-text">
+          <span class="context-menu-label">Neuen Unterordner anlegen</span>
+          <span class="context-menu-desc">Legt einen Ordner innerhalb von „${escapeHtml(folder.name)}" an.</span>
+        </span>
+      </button>
+      <button type="button" class="context-menu-item" role="menuitem" data-folder-action="rename">
+        <span class="context-menu-icon">${ICONS.edit}</span>
+        <span class="context-menu-text">
+          <span class="context-menu-label">Ordner umbenennen</span>
+          <span class="context-menu-desc">Ändert den Namen dieses Ordners.</span>
+        </span>
+      </button>
+      ${hasPrivateVaultFeature() ? `
+      <button type="button" class="context-menu-item" role="menuitem" data-folder-action="move-vault">
+        <span class="context-menu-icon">${folder.private ? LOCK_OPEN_ICON : LOCK_ICON}</span>
+        <span class="context-menu-text">
+          <span class="context-menu-label">${folder.private ? 'In gemeinsamen Tresor verschieben' : 'Ordner privat machen'}</span>
+          <span class="context-menu-desc">${folder.private ? 'Ordner, Unterordner und Einträge sehen danach alle Mitglieder.' : 'Ordner, Unterordner und Einträge siehst danach nur du.'}</span>
+        </span>
+      </button>` : ''}
+      <button type="button" class="context-menu-item context-menu-item-danger" role="menuitem" data-folder-action="delete">
+        <span class="context-menu-icon">${ICONS.trash}</span>
+        <span class="context-menu-text">
+          <span class="context-menu-label">Löschen</span>
+          <span class="context-menu-desc">Entfernt „${escapeHtml(folder.name)}"${descendantText}.</span>
+        </span>
+      </button>`;
+    positionContextMenu(menu, x, y);
+    document.addEventListener('mousedown', onFolderContextMenuOutsideClick, true);
+    document.addEventListener('keydown', onFolderContextMenuKeydown, true);
+    window.addEventListener('scroll', closeFolderContextMenu, true);
+    const first = menu.querySelector('[role="menuitem"]');
+    if (first) first.focus();
+  }
+
+  function positionContextMenu(menu, x, y) {
+    menu.hidden = false;
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+    const rect = menu.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    let left = x, top = y;
+    if (rect.right > vw - 8) left = Math.max(8, x - rect.width);
+    if (rect.bottom > vh - 8) top = Math.max(8, y - rect.height);
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+  }
+
+  function closeFolderContextMenu() {
+    const menu = document.getElementById('folderContextMenu');
+    if (!menu || menu.hidden) return;
+    menu.hidden = true;
+    menu.innerHTML = '';
+    document.removeEventListener('mousedown', onFolderContextMenuOutsideClick, true);
+    document.removeEventListener('keydown', onFolderContextMenuKeydown, true);
+    window.removeEventListener('scroll', closeFolderContextMenu, true);
+    folderContextMenuState = { id: null };
+  }
+
+  function onFolderContextMenuOutsideClick(e) {
+    const menu = document.getElementById('folderContextMenu');
+    if (menu && !menu.contains(e.target)) closeFolderContextMenu();
+  }
+
+  function onFolderContextMenuKeydown(e) {
+    const menu = document.getElementById('folderContextMenu');
+    if (!menu || menu.hidden) return;
+    const items = Array.from(menu.querySelectorAll('[role="menuitem"]'));
+    if (!items.length) return;
+    const currentIndex = items.indexOf(document.activeElement);
+    if (e.key === 'Escape') { e.preventDefault(); closeFolderContextMenu(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); items[(currentIndex + 1 + items.length) % items.length].focus(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); items[(currentIndex - 1 + items.length) % items.length].focus(); }
+    else if (e.key === 'Home') { e.preventDefault(); items[0].focus(); }
+    else if (e.key === 'End') { e.preventDefault(); items[items.length - 1].focus(); }
+  }
+
+  async function onFolderContextMenuItemClick(e) {
+    const btn = e.target.closest('[role="menuitem"]');
+    if (!btn) return;
+    const id = folderContextMenuState.id;
+    const folder = state.folders.find(f => f.id === id);
+    if (!folder) return;
+    const action = btn.dataset.folderAction;
+    closeFolderContextMenu();
+    if (action === 'create-child') {
+      openFolderModal(id);
+    } else if (action === 'rename') {
+      openFolderRenameModal(id);
+    } else if (action === 'delete') {
+      await onDeleteFolderClick(id, folder.name);
+    } else if (action === 'move-vault') {
+      await moveFolderBetweenVaults(folder);
+    }
+  }
+
+  // Ganzen Ordner samt Unterordnern und Einträgen in den anderen Tresor verschieben
+  async function moveFolderBetweenVaults(folder) {
+    const toPrivate = !folder.private;
+    const ids = new Set([String(folder.id), ...state.folders.filter(f => isDescendantOf(f.id, folder.id)).map(f => String(f.id))]);
+    const subfolders = ids.size - 1;
+    const entries = state.passwords.filter(p => ids.has(String(p.folder_id))).length;
+    const parts = [subfolders ? `${subfolders} Unterordner` : '', `${entries} ${entries === 1 ? 'Eintrag' : 'Einträge'}`].filter(Boolean).join(' und ');
+    const question = toPrivate
+      ? `„${folder.name}" mit ${parts} privat machen?\n\nDanach siehst nur du diesen Ordner. Die anderen Mitglieder sehen ihn und die Einträge darin nicht mehr.`
+      : `„${folder.name}" mit ${parts} in den gemeinsamen Tresor verschieben?\n\nDanach sehen alle Mitglieder den Ordner und die Einträge darin.`;
+    if (!confirm(question)) return;
+    try {
+      const res = await fetch(`/api/passwords/folders/${folder.id}/move-vault`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.token}` },
+        body: JSON.stringify({ private: toPrivate })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { showToast(data.error || 'Ordner konnte nicht verschoben werden.', true); return; }
+      await loadVaultData();
+      showToast(`„${folder.name}" ist jetzt im ${toPrivate ? 'privaten' : 'gemeinsamen'} Tresor (${data.folders} Ordner, ${data.entries} ${data.entries === 1 ? 'Eintrag' : 'Einträge'}).`);
+    } catch {
+      showToast('Verbindungsfehler beim Verschieben.', true);
+    }
+  }
+
+  async function onDeleteFolderClick(id, name) {
+    const descendants = countDescendants(id);
+    const descendantText = descendants ? ` und ${descendants} Unterordner` : '';
+    if (!confirm(`„${name}"${descendantText} löschen? Enthaltene Einträge bleiben erhalten und werden nicht mehr zugeordnet.`)) return;
+    try {
+      const res = await fetch(`/api/passwords/folders/${id}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${state.token}` }
+      });
+      if (res.ok) {
+        const deletedIds = new Set([String(id)]);
+        state.folders.filter(f => isDescendantOf(f.id, id)).forEach(f => deletedIds.add(String(f.id)));
+        if (deletedIds.has(state.activeFolder)) state.activeFolder = 'all';
+        await loadVaultData();
+        showToast('Ordner gelöscht.');
+      } else {
+        showToast('Ordner konnte nicht gelöscht werden.', true);
+      }
+    } catch {
+      showToast('Verbindungsfehler beim Löschen des Ordners.', true);
+    }
+  }
+
+  function isDescendantOf(folderId, ancestorId) {
+    let folder = state.folders.find(f => String(f.id) === String(folderId));
+    while (folder && folder.parent_id != null) {
+      if (String(folder.parent_id) === String(ancestorId)) return true;
+      folder = state.folders.find(f => String(f.id) === String(folder.parent_id));
+    }
+    return false;
+  }
+
+  async function onFolderSubmit(e) {
+    e.preventDefault();
+    const name = document.getElementById('folderName').value.trim();
+    if (!name) return;
+    const isRename = state.folderModalMode === 'rename';
+    const url = isRename ? `/api/passwords/folders/${state.editingFolderId}` : '/api/passwords/folders';
+    const payload = isRename
+      ? { name }
+      : { name, parent_id: state.pendingFolderParentId == null ? null : Number(state.pendingFolderParentId), ...(hasPrivateVaultFeature() ? { private: state.vaultMode === 'private' } : {}) };
+    try {
+      const res = await fetch(url, {
+        method: isRename ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.token}` },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (res.ok) {
+        closeFolderModal();
+        await loadVaultData();
+        showToast(isRename ? 'Ordner umbenannt.' : 'Ordner angelegt.');
+      } else {
+        showToast(data.error || (isRename ? 'Ordner konnte nicht umbenannt werden.' : 'Ordner konnte nicht angelegt werden.'), true);
+      }
+    } catch {
+      showToast(isRename ? 'Verbindungsfehler beim Umbenennen des Ordners.' : 'Verbindungsfehler beim Anlegen des Ordners.', true);
+    }
+  }
+
+  function onEntryDragStart(e) {
+    const row = e.target.closest('li.entry-row');
+    if (!row) return;
+    row.classList.add('is-dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', row.dataset.id);
+    e.dataTransfer.setData('application/x-password-entry-id', row.dataset.id);
+  }
+
+  function onEntryDragEnd(e) {
+    const row = e.target.closest('li.entry-row');
+    if (row) row.classList.remove('is-dragging');
+    clearFolderDropState();
+  }
+
+  function clearFolderDropState() {
+    document.querySelectorAll('.folder-row.is-drop-target').forEach(el => el.classList.remove('is-drop-target'));
+  }
+
+  function getDragPayload(e) {
+    const entryId = e.dataTransfer.getData('application/x-password-entry-id');
+    if (entryId) return { type: 'entry', id: Number(entryId) };
+    const plain = e.dataTransfer.getData('text/plain');
+    return plain ? { type: 'entry', id: Number(plain) } : null;
+  }
+
+  function getDropTarget(e) {
+    const row = e.target.closest('[data-drop-folder]');
+    if (!row || row.dataset.folderKey === 'all') return null;
+    const raw = row.dataset.dropFolder;
+    return {
+      el: row,
+      entryTarget: raw === 'none' ? null : Number(raw),
+      raw,
+    };
+  }
+
+  function isValidDropTarget(payload, target) {
+    return payload?.type === 'entry' && !!target;
+  }
+
+  function hasEntryDragType(e) {
+    const types = e.dataTransfer && e.dataTransfer.types;
+    if (!types) return false;
+    return Array.from(types).includes('application/x-password-entry-id');
+  }
+
+  function onFolderDragOver(e) {
+    const target = getDropTarget(e);
+    if (!hasEntryDragType(e) || !target) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    target.el.classList.add('is-drop-target');
+  }
+
+  function onFolderDragLeave(e) {
+    const target = getDropTarget(e);
+    if (target && !target.el.contains(e.relatedTarget)) target.el.classList.remove('is-drop-target');
+  }
+
+  async function onFolderDrop(e) {
+    const payload = getDragPayload(e);
+    const target = getDropTarget(e);
+    if (!target) return;
+    e.preventDefault();
+    target.el.classList.remove('is-drop-target');
+    if (!isValidDropTarget(payload, target)) {
+      clearFolderDropState();
+      return;
+    }
+
+    await moveEntryToFolder(payload.id, target.entryTarget, target.raw);
+    clearFolderDropState();
+  }
+
+  async function moveEntryToFolder(id, targetFolderId, rawTarget) {
+    const pw = state.passwords.find(p => p.id === id);
+    if (!pw) return;
+    if ((pw.folder_id || null) === targetFolderId) return;
+    const payload = {
+      name: pw.name,
+      username: pw.username,
+      url: pw.url || '',
+      notes: pw.notes || '',
+      folder_id: targetFolderId,
+    };
+    try {
+      const res = await fetch(`/api/passwords/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.token}` },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (res.ok) {
+        const targetName = rawTarget === 'none' ? 'Ohne Ordner' : (state.folders.find(f => f.id === targetFolderId)?.name || 'Ordner');
+        await loadVaultData();
+        showToast(rawTarget === 'none' ? `„${pw.name}" aus Ordner gelöst.` : `„${pw.name}" nach „${targetName}" verschoben.`);
+      } else {
+        showToast(data.error || 'Eintrag konnte nicht verschoben werden.', true);
+      }
+    } catch {
+      showToast('Verbindungsfehler beim Verschieben.', true);
+    }
+  }
+
+
+  function populateFolderSelect(selectedId) {
+    const select = document.getElementById('entryFolder');
+    const flatten = (nodes, level = 0) => nodes.flatMap(node => [
+      { ...node, level },
+      ...flatten(node.children || [], level + 1)
+    ]);
+    // Nur Ordner des Tresors, in dem der Eintrag landet
+    const wantPrivate = hasPrivateVaultFeature() && document.getElementById('entryPrivate').checked;
+    const folders = (state.allFolders || state.folders).filter(f => Boolean(f.private) === wantPrivate);
+    const options = flatten(buildFolderTree(folders)).map(f => `<option value="${f.id}">${'— '.repeat(f.level)}${escapeHtml(f.name)}</option>`).join('');
+    select.innerHTML = `<option value="">Kein Ordner</option>${options}`;
+    select.value = selectedId ? String(selectedId) : '';
+  }
+
+  function renderList() {
+    const list = document.getElementById('entryList');
+    const emptyState = document.getElementById('emptyState');
+    const q = state.searchQuery;
+
+    let scoped = state.passwords;
+    if (state.activeFolder === 'none') {
+      scoped = scoped.filter(p => !p.folder_id);
+    } else if (state.activeFolder !== 'all') {
+      scoped = scoped.filter(p => String(p.folder_id) === state.activeFolder);
+    }
+
+    const filtered = scoped.filter(p =>
+      p.name.toLowerCase().includes(q) ||
+      p.username.toLowerCase().includes(q) ||
+      (p.notes && p.notes.toLowerCase().includes(q))
+    );
+
+    if (filtered.length === 0) {
+      list.innerHTML = '';
+      list.style.display = 'none';
+      if (state.activeFolder !== 'all') {
+        emptyState.innerHTML = q
+          ? `<div class="empty-state"><h3>Keine Treffer</h3><p>Kein Eintrag in diesem Ordner passt zu „${escapeHtml(state.searchQuery)}".</p></div>`
+          : `<div class="empty-state"><h3>Ordner ist leer</h3><p>Dieser Ordner enthält noch keine Einträge.</p></div>`;
+      } else {
+        emptyState.innerHTML = q
+          ? `<div class="empty-state"><h3>Keine Treffer</h3><p>Kein Eintrag passt zu „${escapeHtml(state.searchQuery)}". Schreibweise prüfen oder einen neuen Eintrag anlegen.</p></div>`
+          : (state.vaultMode === 'private'
+            ? `<div class="empty-state"><h3>Dein privater Tresor ist leer</h3><p>Hier speicherst du Zugänge, die nur du sehen darfst. Mit „Neuer Eintrag" anlegen oder einen Eintrag im gemeinsamen Tresor über das Menü „In privaten Tresor verschieben" herüberholen.</p></div>`
+            : `<div class="empty-state"><h3>Noch keine Einträge</h3><p>Mit „Neuer Eintrag" den ersten Zugang anlegen.</p></div>`);
+      }
+      return;
+    }
+
+    list.style.display = '';
+    emptyState.innerHTML = '';
+
+    const pwGroups = new Map();
+    state.passwords.forEach(p => {
+      if (!p.password) return;
+      if (!pwGroups.has(p.password)) pwGroups.set(p.password, []);
+      pwGroups.get(p.password).push(p);
+    });
+
+    list.innerHTML = filtered.map(p => {
+      const shown = !!state.shown[p.id];
+      const masked = maskOf(p.password);
+      const dupGroup = p.password ? pwGroups.get(p.password) : null;
+      let warningHtml = '';
+      if (dupGroup && dupGroup.length > 1) {
+        const others = dupGroup.filter(o => o.id !== p.id).map(o => `„${escapeHtml(o.name)}“`).join(', ');
+        const warnLabel = `Dieses Passwort wird auch bei ${others} verwendet.`;
+        warningHtml = `<span class="entry-warning-icon" role="img" title="${warnLabel}" aria-label="${warnLabel}">${ICONS.warning}</span>`;
+      }
+      return `
+        <li class="entry-row" data-id="${p.id}" draggable="true">
+          <div class="entry-main">
+            <div class="entry-primary">
+              <span class="entry-name">${escapeHtml(p.name)}</span>${warningHtml}
+              ${p.url ? `<a class="entry-url" href="${escapeHtml(p.url)}" target="_blank" rel="noopener noreferrer" draggable="false">${escapeHtml(hostnameOf(p.url))}</a>` : ''}
+            </div>
+            <div class="entry-secondary">
+              <span class="entry-username mono">${escapeHtml(p.username)}</span>
+              <span class="mono"><span class="pw-chars">${shown ? escapeHtml(p.password) : masked}</span></span>
+              ${p.totp_secret ? `<span class="entry-totp"><span class="entry-totp-code mono" data-totp-id="${p.id}">······</span><span class="entry-totp-countdown" data-totp-countdown-id="${p.id}"></span></span>` : ''}
+              ${p.notes ? `<span class="entry-notes">${escapeHtml(p.notes)}</span>` : ''}
+            </div>
+          </div>
+          <div class="entry-actions">
+            <button type="button" class="btn btn-icon" data-action="toggle" aria-label="${shown ? 'Passwort verbergen' : 'Passwort anzeigen'}" title="${shown ? 'Passwort verbergen' : 'Passwort anzeigen'}">${shown ? ICONS.eyeOff : ICONS.eye}</button>
+            <button type="button" class="btn btn-icon" data-action="copy-username" aria-label="Benutzername kopieren" title="Benutzername kopieren">${ICONS.copy}</button>
+            <button type="button" class="btn btn-icon" data-action="copy-password" aria-label="Passwort kopieren" title="Passwort kopieren">${ICONS.copy}</button>
+            ${p.totp_secret ? `<button type="button" class="btn btn-icon" data-action="copy-totp" aria-label="TOTP-Code kopieren" title="TOTP-Code kopieren">${ICONS.totp}</button>` : ''}
+            <button type="button" class="btn btn-icon" data-action="edit" aria-label="Eintrag bearbeiten" title="Bearbeiten">${ICONS.edit}</button>
+            <button type="button" class="btn btn-icon btn-danger" data-action="delete" aria-label="Eintrag löschen" title="Löschen">${ICONS.trash}</button>
+          </div>
+        </li>
+      `;
+    }).join('');
+  }
+
+  // Nach einer frischen Anmeldung startet man auf dem Dashboard; ein offener Tresor-Tab bleibt im Tresor
+  function afterLogin({ fresh = false } = {}) {
+    const params = new URLSearchParams(window.location.search);
+    const next = nextTarget();
+    if (next) { window.location.replace(next); return; }
+    if (params.has('admin') && canManageUsers()) { renderAdmin(); startInactivityMonitor(); return; }
+    if (!hasModule('vault')) {
+      // Ohne Tresor: Startseite ist das Dashboard; gibt es keins, bleibt nur die Benutzerverwaltung
+      if (HOME_PATH !== '/') { window.location.replace(HOME_PATH); return; }
+      renderAdmin();
+      startInactivityMonitor();
+      return;
+    }
+    if (fresh && HOME_PATH !== '/' && !params.has('entry')) { window.location.replace(HOME_PATH); return; }
+    renderVault();
+    startInactivityMonitor();
+  }
+
+  // Treffer aus der globalen Suche (oder ?entry=ID) im Tresor anzeigen
+  function revealVaultEntry(id) {
+    const any = (state.allPasswords || state.passwords).find(p => Number(p.id) === Number(id));
+    if (any && hasPrivateVaultFeature() && Boolean(any.private) !== (state.vaultMode === 'private')) {
+      setVaultMode(any.private ? 'private' : 'shared');
+    }
+    const entry = state.passwords.find(p => Number(p.id) === Number(id));
+    if (!entry) return false;
+    state.activeFolder = 'all';
+    state.searchQuery = String(entry.name || '').toLowerCase();
+    const input = document.getElementById('searchInput');
+    if (input) input.value = entry.name || '';
+    renderFolderTree();
+    renderList();
+    const row = document.querySelector(`li.entry-row[data-id="${entry.id}"]`);
+    if (row) {
+      row.scrollIntoView({ block: 'center' });
+      row.classList.add('is-revealed');
+      setTimeout(() => row.classList.remove('is-revealed'), 2400);
+    }
+    return true;
+  }
+
+  onSearchNavigate((hit) => {
+    if (hit.type !== 'vault' || !document.getElementById('entryList')) return false;
+    return revealVaultEntry(hit.id);
+  });
+
+  async function init() {
+    setLogoutHandler(() => renderLogin());
+    if (!state.token) { renderLogin(); return; }
+    try {
+      const res = await fetch('/api/auth/me', { headers: { 'Authorization': `Bearer ${state.token}` } });
+      if (res.ok) {
+        setCurrentUser(await res.json());
+        afterLogin();
+      } else { handleUnauthorized(); }
+    } catch {
+      renderLogin();
+    }
+  }
+
+  startTotpTicker();
+  init();
+</script>
+</body>
+</html>
